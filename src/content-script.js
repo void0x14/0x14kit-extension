@@ -17,6 +17,7 @@ function btSafeRoot() {
 
 let isTranslating = false;
 let translatingTimeout = null;
+let suggestionAutoHideTimer = null;
 let lastAppliedText = "";
 let lastAppliedAt = 0;
 let debounceTimer = null;
@@ -1546,10 +1547,15 @@ async function handleInstantTranslate(element) {
 
       const position = domainConfig.position || 'auto';
       const providerInfo = `${out.meta.providerName || 'AI'} (${out.meta.providerType || 'Bot'})`;
+      destroyCurrentSuggestion();
       currentSuggestion = buildInlineSuggestion(element, out.translation, providerInfo, position, settings);
       currentSuggestion._segments = out.segments;
       currentSuggestion._ownJoined = out.ownJoined;
       setupSuggestionKeyHandlers(element, currentSuggestion);
+      // Auto-expire: a suggestion is only useful for a few seconds
+      suggestionAutoHideTimer = setTimeout(() => {
+        destroyCurrentSuggestion();
+      }, 8000);
 
       // Handle provider change
       if (currentSuggestion.providerSelect) {
@@ -1609,6 +1615,32 @@ async function reTranslateSuggestion(element, ownJoinedText, providerId, setting
 }
 
 
+// Kill the current suggestion and every thing attached to it (key handlers,
+// pending timers). Single funnel so no path can leave a stale popup behind.
+function destroyCurrentSuggestion() {
+  if (instantTimer) {
+    clearTimeout(instantTimer);
+    instantTimer = null;
+  }
+  if (suggestionAutoHideTimer) {
+    clearTimeout(suggestionAutoHideTimer);
+    suggestionAutoHideTimer = null;
+  }
+  if (currentKeyHandler) {
+    try {
+      document.removeEventListener("keydown", currentKeyHandler, true);
+      window.removeEventListener("keydown", currentKeyHandler, true);
+      document.removeEventListener("keyup", currentKeyHandler, true);
+      window.removeEventListener("keyup", currentKeyHandler, true);
+    } catch (e) {}
+    currentKeyHandler = null;
+  }
+  if (currentSuggestion) {
+    try { currentSuggestion.destroy(); } catch (e) {}
+    currentSuggestion = null;
+  }
+}
+
 function registerInstantMode() {
   // Common typing handler shared by input and beforeinput listeners. Some
   // model-driven editors (CKEditor5) preventDefault native editing and never
@@ -1655,18 +1687,30 @@ function registerInstantMode() {
     if (currentSuggestion) {
       const isInsideInput = e.target === getActiveEditableElement();
       const isInsideSuggestion = currentSuggestion.element.contains(e.target);
-      
+
       if (!isInsideInput && !isInsideSuggestion) {
-        // Cleanup key handler if it exists
-        if (currentKeyHandler) {
-          document.removeEventListener("keydown", currentKeyHandler, true);
-          currentKeyHandler = null;
-        }
-        
-        currentSuggestion.destroy();
-        currentSuggestion = null;
+        destroyCurrentSuggestion();
       }
     }
+  });
+
+
+  // This frame lost focus (user clicked into another frame/area): kill it.
+  window.addEventListener('blur', () => {
+    if (currentSuggestion) destroyCurrentSuggestion();
+  });
+
+  // Real page scrolls make the anchored position stale (chat apps): kill it.
+  // Caret auto-scrolls inside editors are nested, small and harmless — only
+  // window-level scrolls beyond a threshold count.
+  let lastScrollY = window.scrollY;
+  let lastScrollX = window.scrollX;
+  window.addEventListener('scroll', () => {
+    const dy = Math.abs(window.scrollY - lastScrollY);
+    const dx = Math.abs(window.scrollX - lastScrollX);
+    lastScrollY = window.scrollY;
+    lastScrollX = window.scrollX;
+    if (currentSuggestion && (dy > 30 || dx > 30)) destroyCurrentSuggestion();
   });
   
   // Any editing keypress while a suggestion is visible kills it immediately,
@@ -1676,19 +1720,7 @@ function registerInstantMode() {
     if (!currentSuggestion) return;
     if (e.key === "Tab" || e.key === "Enter" || e.key === "Escape") return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (currentKeyHandler) {
-      document.removeEventListener("keydown", currentKeyHandler, true);
-      window.removeEventListener("keydown", currentKeyHandler, true);
-      document.removeEventListener("keyup", currentKeyHandler, true);
-      window.removeEventListener("keyup", currentKeyHandler, true);
-      currentKeyHandler = null;
-    }
-    currentSuggestion.destroy();
-    currentSuggestion = null;
-    if (instantTimer) {
-      clearTimeout(instantTimer);
-      instantTimer = null;
-    }
+    destroyCurrentSuggestion();
   }, true);
 
   // Listen for Enter key to cancel instant translate
@@ -2120,7 +2152,12 @@ function cleanupExtensionElements() {
       clearTimeout(instantTimer);
       instantTimer = null;
     }
-    
+
+    if (suggestionAutoHideTimer) {
+      clearTimeout(suggestionAutoHideTimer);
+      suggestionAutoHideTimer = null;
+    }
+
     // Clear any global timers
     if (window.transkitCleanupTimer) {
       clearTimeout(window.transkitCleanupTimer);
