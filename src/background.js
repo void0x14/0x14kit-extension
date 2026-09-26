@@ -222,11 +222,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const settings = await readSettings();
         // Extract payload using keys sent by content-script.js
         const { text, nativeLanguageCode, targetLanguage, sourceLanguage, providerId } = message.payload || {};
-        
+
         // Map to standardized keys for AIProviderService
         // Use 'auto' if sourceLanguage is not explicitly provided
-        const sourceLang = sourceLanguage || "auto"; 
+        const sourceLang = sourceLanguage || "auto";
         const targetLang = targetLanguage;
+
+        // Deterministic test mode: exercises the whole DOM/pipeline stack
+        // (segmentation, apply engine, popups) without any network dependency.
+        if (settings.testEchoMode) {
+          const echoed = String(text || "")
+            .split(/\n{2,}/)
+            .map((p) => "ECHO:" + p.trim())
+            .join("\n\n");
+          sendResponse({
+            ok: true,
+            result: {
+              translation: echoed,
+              providerName: "Echo (test)",
+              providerType: "echo",
+              sourceLanguage: sourceLang,
+              targetLanguage: targetLang
+            }
+          });
+          return;
+        }
 
         const aiService = new AIProviderService(settings);
         
@@ -377,6 +397,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     })();
 
+    return true;
+  }
+
+  if (message?.type === "page-exec-insert") {
+    // Model-driven editors (Lexical, ProseMirror, Quill, CKEditor) ignore
+    // isolated-world execCommand; the same edit from the page's MAIN world
+    // goes through their real editing pipeline. Runs in the sender's frame.
+    (async () => {
+      const dbg = async (msg) => {
+        try {
+          const { tkDebugLog: l = [] } = await chrome.storage.local.get("tkDebugLog");
+          await chrome.storage.local.set({ tkDebugLog: [...l.slice(-20), { t: Date.now(), msg: String(msg).slice(0, 200) }] });
+        } catch (e) {}
+      };
+      try {
+        await dbg("page-exec-insert: scripting=" + !!chrome.scripting + " tab=" + sender.tab?.id + " frame=" + sender.frameId);
+        const text = String(message.text ?? "");
+        const results = await chrome.scripting.executeScript({
+          target: {
+            tabId: sender.tab.id,
+            frameIds: [sender.frameId]
+          },
+          world: "MAIN",
+          func: (insertText) => {
+            const el = document.activeElement;
+            if (!el || (!el.isContentEditable && el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return "no-active-element:" + (el ? el.tagName : "null");
+            document.execCommand("selectAll", false, null);
+            const sel = window.getSelection();
+            const selInfo = "sel=[" + String(sel ? sel.toString().slice(0, 25) : "null") + "]rng=" + (sel ? sel.rangeCount : -1);
+            const ok = document.execCommand("insertText", false, insertText);
+            return "ok=" + ok + " " + selInfo + " after=" + String(el.innerText || el.value || "").slice(0, 25);
+          },
+          args: [text]
+        });
+        await dbg("page-exec-insert result=" + JSON.stringify(results?.[0]?.result));
+        sendResponse({ ok: results?.[0]?.result === true });
+      } catch (err) {
+        await dbg("page-exec-insert ERROR " + String(err?.message || err));
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
     return true;
   }
 

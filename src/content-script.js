@@ -848,7 +848,7 @@ async function setFieldText(element, text, options = {}) {
   const isBox = tag === "input" || tag === "textarea";
   const strategies = isBox
     ? ["native-setter", "plain-value", "input-event", "paste"]
-    : ["exec-insert", "paste", "beforeinput", "range-replace"];
+    : ["page-world", "exec-insert", "paste", "beforeinput", "range-replace"];
 
   const normalizedTarget = String(text || "").replace(/\s+/g, " ").trim();
 
@@ -856,10 +856,11 @@ async function setFieldText(element, text, options = {}) {
     try { element.focus(); } catch (e) {}
   }
 
-  // Snapshot the original content for contenteditable restore
-  let snapshot = null;
+  // Snapshot the original content for contenteditable restore. Keep a deep
+  // template: the restore must be repeatable across every strategy retry.
+  let snapshotTemplate = null;
   if (!isBox) {
-    try { snapshot = element.cloneNode(true); } catch (e) {}
+    try { snapshotTemplate = element.cloneNode(true); } catch (e) {}
   }
 
   const verified = () => {
@@ -868,20 +869,34 @@ async function setFieldText(element, text, options = {}) {
     return now === normalizedTarget;
   };
 
+  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+
   for (let i = 0; i < strategies.length; i++) {
     // Restore original content before retrying with the next strategy
-    if (i > 0 && snapshot) {
+    if (i > 0 && snapshotTemplate) {
       try {
-        element.replaceChildren(...Array.from(snapshot.childNodes));
+        const fresh = snapshotTemplate.cloneNode(true);
+        element.replaceChildren(...Array.from(fresh.childNodes));
         element.dispatchEvent(new InputEvent("input", { bubbles: true }));
         if (document.activeElement !== element) { try { element.focus(); } catch (e) {} }
       } catch (e) {}
     }
 
-    try {
-      applyFieldStrategy(element, strategies[i], text, isBox);
-    } catch (e) {
-      continue;
+    // Let model-driven editors finish reconciling the previous attempt's
+    // DOM changes; a page-world edit landing mid-reconciliation gets reverted.
+    if (!isBox && i > 0) await raf();
+
+    if (typeof console !== "undefined") console.log("[TK-debug]", "strategy", strategies[i], "before:", readFieldText(element).slice(0, 40));
+    if (strategies[i] === "page-world") {
+      const ok = await applyPageWorldInsert(text).catch((e) => { console.log("[TK-debug]", "page-world error", String(e)); return false; });
+      console.log("[TK-debug]", "page-world ok=", ok);
+      if (!ok) continue;
+    } else {
+      try {
+        applyFieldStrategy(element, strategies[i], text, isBox);
+      } catch (e) {
+        continue;
+      }
     }
 
     if (isBox) {
@@ -891,7 +906,8 @@ async function setFieldText(element, text, options = {}) {
 
     // Model-driven editors (Lexical, ProseMirror, Quill) reconcile their DOM
     // asynchronously; give them a frame before judging the result.
-    await new Promise((r) => requestAnimationFrame(() => r()));
+    await raf();
+    console.log("[TK-debug]", "after", strategies[i], "now:", readFieldText(element).slice(0, 60), "verified:", verified());
     if (verified()) return true;
   }
   return false;
@@ -902,6 +918,19 @@ function readFieldText(element) {
   const tag = element.tagName?.toLowerCase();
   if (tag === "input" || tag === "textarea") return element.value || "";
   return element.innerText || element.textContent || "";
+}
+
+// Re-run the select-all + insert edit inside the page's MAIN world. Editors
+// with their own document model only honor real browser editing events; an
+// isolated-world execCommand is invisible to them.
+async function applyPageWorldInsert(text) {
+  if (!isExtensionContextValid()) return false;
+  try {
+    const res = await sendMessageWithRetry({ type: "page-exec-insert", text }, 1, 100);
+    return !!res?.ok;
+  } catch (e) {
+    return false;
+  }
 }
 
 function nativeValueSetter(element, isBox) {
@@ -950,22 +979,27 @@ function applyFieldStrategy(element, strategy, text, isBox) {
 
   // contenteditable strategies
   if (strategy === "exec-insert") {
-    const sel = window.getSelection();
-    if (!sel) { element.textContent = text; }
-    else {
-      const range = document.createRange();
-      range.selectNodeContents(element);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      const ok = document.execCommand("insertText", false, text);
-      if (!ok) element.textContent = text;
-      const endRange = document.createRange();
-      endRange.selectNodeContents(element);
-      endRange.collapse(false);
-      sel.removeAllRanges();
-      sel.addRange(endRange);
-      try { sel.collapseToEnd(); } catch (_) {}
+    // selectAll via execCommand keeps model-driven editors (Lexical,
+    // ProseMirror, Quill) in sync — a manual DOM range is ignored by their
+    // internal selection state and the insert ends up appended at the caret.
+    let selDone = false;
+    try {
+      selDone = document.execCommand("selectAll", false, null);
+    } catch (e) {}
+    if (!selDone) {
+      const sel = window.getSelection();
+      if (sel) {
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } else {
+        element.textContent = text;
+      }
     }
+    const ok = document.execCommand("insertText", false, text);
+    if (!ok) element.textContent = text;
+    try { window.getSelection()?.collapseToEnd(); } catch (_) {}
     element.dispatchEvent(new InputEvent("input", { bubbles: true }));
     element.dispatchEvent(new Event("change", { bubbles: true }));
   } else if (strategy === "paste") {

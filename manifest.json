@@ -52,7 +52,8 @@
   ],
   "permissions": [
     "storage",
-    "offscreen"
+    "offscreen",
+    "scripting"
   ],
   "web_accessible_resources": [
     {
