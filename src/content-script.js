@@ -869,7 +869,7 @@ async function setFieldText(element, text, options = {}) {
     return now === normalizedTarget;
   };
 
-  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const raf = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   for (let i = 0; i < strategies.length; i++) {
     // Restore original content before retrying with the next strategy
@@ -886,10 +886,8 @@ async function setFieldText(element, text, options = {}) {
     // DOM changes; a page-world edit landing mid-reconciliation gets reverted.
     if (!isBox && i > 0) await raf();
 
-    if (typeof console !== "undefined") console.log("[TK-debug]", "strategy", strategies[i], "before:", readFieldText(element).slice(0, 40));
     if (strategies[i] === "page-world") {
-      const ok = await applyPageWorldInsert(text).catch((e) => { console.log("[TK-debug]", "page-world error", String(e)); return false; });
-      console.log("[TK-debug]", "page-world ok=", ok);
+      const ok = await applyPageWorldInsert(element, text).catch(() => false);
       if (!ok) continue;
     } else {
       try {
@@ -905,9 +903,8 @@ async function setFieldText(element, text, options = {}) {
     }
 
     // Model-driven editors (Lexical, ProseMirror, Quill) reconcile their DOM
-    // asynchronously; give them a frame before judging the result.
-    await raf();
-    console.log("[TK-debug]", "after", strategies[i], "now:", readFieldText(element).slice(0, 60), "verified:", verified());
+    // asynchronously; give them two frames before judging the result.
+    await raf(); await raf();
     if (verified()) return true;
   }
   return false;
@@ -920,17 +917,45 @@ function readFieldText(element) {
   return element.innerText || element.textContent || "";
 }
 
-// Re-run the select-all + insert edit inside the page's MAIN world. Editors
-// with their own document model only honor real browser editing events; an
-// isolated-world execCommand is invisible to them.
-async function applyPageWorldInsert(text) {
-  if (!isExtensionContextValid()) return false;
-  try {
-    const res = await sendMessageWithRetry({ type: "page-exec-insert", text }, 1, 100);
-    return !!res?.ok;
-  } catch (e) {
-    return false;
-  }
+// Re-run the select-all + insert edit inside the page's MAIN world, targeted
+// AT the exact element (CustomEvent target preserves identity even when the
+// editor re-renders). Model-driven editors only honor edits that go through
+// the page's real event pipeline.
+function applyPageWorldInsert(element, text) {
+  return new Promise((resolve) => {
+    if (!isExtensionContextValid()) return resolve(false);
+
+    const nonce = Math.random().toString(36).slice(2);
+    let settled = false;
+
+    const onResult = (e) => {
+      if (!e.detail || e.detail.nonce !== nonce) return;
+      settled = true;
+      element.removeEventListener("__transkitPageExecResult", onResult);
+      resolve(!!e.detail.ok);
+    };
+    element.addEventListener("__transkitPageExecResult", onResult);
+
+    try {
+      element.dispatchEvent(
+        new CustomEvent("__transkitPageExec", {
+          bubbles: true,
+          cancelable: false,
+          detail: { text, nonce }
+        })
+      );
+    } catch (e) {
+      settled = true;
+      resolve(false);
+    }
+
+    setTimeout(() => {
+      if (!settled) {
+        element.removeEventListener("__transkitPageExecResult", onResult);
+        resolve(false);
+      }
+    }, 250);
+  });
 }
 
 function nativeValueSetter(element, isBox) {
@@ -1307,8 +1332,12 @@ function setupSuggestionKeyHandlers(element, suggestion) {
     // Set flag to prevent instant translate from re-triggering
     justAppliedTranslation = true;
 
-    // Apply translation IMMEDIATELY with Lexical-compatible method
-    setFieldText(element, suggestion.translatedText, { immediate: true });
+    // Apply OUTSIDE the keydown task in a clean macrotask: model-driven
+    // editors (Lexical etc.) swallow inserts that arrive within one macrotask
+    // of a handled keydown ("bogus text replacement" guard).
+    setTimeout(() => {
+      setFieldText(element, suggestion.translatedText, { immediate: true });
+    }, 0);
 
     // Destroy popup after a tiny delay to ensure insertion completes
     setTimeout(() => {
@@ -1552,8 +1581,12 @@ async function reTranslateSuggestion(element, ownJoinedText, providerId, setting
 
 
 function registerInstantMode() {
-  // Listen for input changes
-  document.addEventListener('input', async (e) => {
+  // Common typing handler shared by input and beforeinput listeners. Some
+  // model-driven editors (CKEditor5) preventDefault native editing and never
+  // fire "input" — only "beforeinput" — so both are wired to the same
+  // debounced path (handleInstantTranslate re-arms its timer, so duplicates
+  // from editors firing both events are harmless).
+  const onTypingEvent = async (e) => {
     // Resolve the editable element from the event itself: composedPath()
     // crosses shadow roots, so this works on sites where document.activeElement
     // is a host element or where focus is moved programmatically after typing.
@@ -1568,6 +1601,15 @@ function registerInstantMode() {
     if (TRANSLATION_COMMAND_PATTERN.test(text)) return;
 
     handleInstantTranslate(element);
+  };
+
+  // Listen for input changes
+  document.addEventListener('input', onTypingEvent, true);
+  document.addEventListener('beforeinput', (e) => {
+    if (typeof e.inputType === "string" && e.inputType.startsWith("insert")
+        && !e.inputType.includes("Composition")) {
+      onTypingEvent(e);
+    }
   }, true);
 
   // Track IME composition state for proper handling
