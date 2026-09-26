@@ -5,8 +5,8 @@ const enabledCheckbox = document.querySelector("#enabled");
 const settingsContainer = document.querySelector("#settings-container");
 const nativeSelect = document.querySelector("#native");
 const targetSelect = document.querySelector("#target");
-const timeoutInput = document.querySelector("#timeout");
-const preferNative = document.querySelector("#prefer-native");
+
+const autoDetect = document.querySelector("#auto-detect");
 const confirmModal = document.querySelector("#confirm-modal");
 const saveBtn = document.querySelector("#save");
 const aliasListEl = document.querySelector("#alias-list");
@@ -21,6 +21,13 @@ const instantDelayInput = document.querySelector("#instant-delay");
 const domainListEl = document.querySelector("#instant-domain-list");
 const newDomainInput = document.querySelector("#new-domain");
 const addDomainBtn = document.querySelector("#add-domain");
+
+// Keyboard shortcut elements
+const shortcutCtrlCheckbox = document.querySelector("#shortcut-ctrl");
+const shortcutShiftCheckbox = document.querySelector("#shortcut-shift");
+const shortcutAltCheckbox = document.querySelector("#shortcut-alt");
+const shortcutKeyInput = document.querySelector("#shortcut-key");
+const shortcutPreview = document.querySelector("#shortcut-preview");
 
 // Provider List elements
 const providerListEl = document.querySelector("#provider-list");
@@ -38,14 +45,43 @@ const systemPromptDisplay = document.querySelector("#system-prompt-display");
 const userCustomPrompt = document.querySelector("#user-custom-prompt");
 const promptCharCount = document.querySelector("#prompt-char-count");
 
-// System prompt constant (matches ai-providers.js)
-const DEFAULT_SYSTEM_PROMPT = "You are a professional translator. Translate the user's text from {sourceLang} to {targetLang}. Return ONLY the translated text.";
+// Hover to Translate elements
+const hoverTranslateEnabled = document.getElementById('hover-translate-enabled');
+const hoverUniqueMode = document.getElementById('hover-unique-mode');
+const hoverSettings = document.getElementById('hover-settings');
+const hoverMode = document.getElementById('hover-mode');
+const hoverGranularity = document.getElementById('hover-granularity');
+const hoverModifier = document.getElementById('hover-modifier');
+const hoverShortcutCtrl = document.getElementById('hover-shortcut-ctrl');
+const hoverShortcutShift = document.getElementById('hover-shortcut-shift');
+const hoverShortcutAlt = document.getElementById('hover-shortcut-alt');
+const hoverShortcutKey = document.getElementById('hover-shortcut-key');
+const hoverShortcutPreview = document.getElementById('hover-shortcut-preview');
+// const hoverBgColor = document.getElementById('hover-bg-color'); // Removed
+const hoverTextColor = document.getElementById('hover-text-color');
+const hoverFontSize = document.getElementById('hover-font-size');
+const hoverShowIcon = document.getElementById('hover-show-icon');
+const hoverUnderline = document.getElementById('hover-underline');
+const manageHoverDomains = document.getElementById('manage-hover-domains');
+const hoverDomainListSection = document.getElementById('hover-domain-list-section');
+const hoverDomainList = document.getElementById('hover-domain-list');
+const hoverDomainCount = document.getElementById('hover-domain-count');
+const newHoverDomain = document.getElementById('new-hover-domain');
+const addHoverDomain = document.getElementById('add-hover-domain');
 
 let currentAliases = {};
 let currentDomains = [];
+let currentHoverDomains = [];
 let providers = [];
 let activeProviderId = "builtin";
 let editingProviderId = null;
+let isSettingsLoaded = false;
+let isNewProvider = false;
+
+let ttsProviders = [];
+let activeTTSProviderId = "google-tts";
+let editingTTSProviderId = null;
+let isNewTTSProvider = false;
 
 const LANGUAGES = [
   { code: "en", name: "English" },
@@ -82,6 +118,15 @@ function translateUI() {
     saveBtn.textContent = i18n.t("popup.saved");
   } else {
     saveBtn.textContent = i18n.t("popup.savePreferences");
+  }
+}
+
+// Display version in header
+function displayVersion() {
+  const manifest = chrome.runtime.getManifest();
+  const versionEl = document.getElementById('version-display');
+  if (versionEl && manifest.version) {
+    versionEl.textContent = `v${manifest.version}`;
   }
 }
 
@@ -124,37 +169,18 @@ function renderAliases() {
 
 function renderDomains() {
   if (!domainListEl) return;
-  
+
   domainListEl.innerHTML = "";
   currentDomains.forEach((item, index) => {
     const div = document.createElement("div");
     div.className = "bt-domain-item";
     div.innerHTML = `
-      <input type="checkbox" ${item.enabled ? 'checked' : ''} data-index="${index}" />
       <span class="bt-domain-name">${item.domain}</span>
-      <select class="bt-position-select" data-index="${index}">
-        <option value="bottom" ${item.position === 'bottom' ? 'selected' : ''}>Bottom</option>
-        <option value="top" ${item.position === 'top' ? 'selected' : ''}>Top</option>
-      </select>
       <button class="bt-remove-alias" data-index="${index}">×</button>
     `;
     domainListEl.appendChild(div);
   });
-  
-  domainListEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-    cb.addEventListener('change', (e) => {
-      currentDomains[e.target.dataset.index].enabled = e.target.checked;
-      saveSettings();
-    });
-  });
-  
-  domainListEl.querySelectorAll('.bt-position-select').forEach(select => {
-    select.addEventListener('change', (e) => {
-      currentDomains[e.target.dataset.index].position = e.target.value;
-      saveSettings();
-    });
-  });
-  
+
   domainListEl.querySelectorAll('.bt-remove-alias').forEach(btn => {
     btn.addEventListener('click', (e) => {
       currentDomains.splice(e.target.dataset.index, 1);
@@ -167,9 +193,12 @@ function renderDomains() {
 function renderProviderList() {
   providerListEl.innerHTML = "";
   
+  // Define default provider IDs that cannot be edited or deleted
+  const DEFAULT_PROVIDER_IDS = ["google-translate", "builtin"];
+  
   providers.forEach(p => {
     const isActive = p.id === activeProviderId;
-    const isBuiltin = p.id === "builtin";
+    const isDefaultProvider = DEFAULT_PROVIDER_IDS.includes(p.id);
     
     const el = document.createElement("div");
     el.className = `bt-provider-item ${isActive ? 'active' : ''}`;
@@ -182,7 +211,8 @@ function renderProviderList() {
       actionsHtml += `<button class="bt-btn-text btn-set-active" data-id="${p.id}">${i18n.t("popup.use")}</button>`;
     }
     
-    if (!isBuiltin) {
+    // Only allow edit/delete for non-default providers
+    if (!isDefaultProvider) {
       actionsHtml += `<button class="bt-btn-text btn-edit" data-id="${p.id}">${i18n.t("popup.edit")}</button>`;
       actionsHtml += `<button class="bt-btn-text btn-delete" data-id="${p.id}">${i18n.t("popup.delete")}</button>`;
     }
@@ -213,7 +243,8 @@ function renderProviderList() {
       if (confirm("Delete this provider?")) {
         providers = providers.filter(p => p.id !== e.target.dataset.id);
         if (activeProviderId === e.target.dataset.id) {
-          activeProviderId = "builtin";
+          // Fallback to Google Translate instead of builtin
+          activeProviderId = "google-translate";
         }
         renderProviderList();
         saveSettings();
@@ -250,6 +281,11 @@ function getProviderInfo(type) {
       return {
         link: 'https://www.deepl.com/your-account/keys',
         text: 'DeepL Account'
+      };
+    case 'groq':
+      return {
+        link: 'https://console.groq.com/keys',
+        text: 'Groq Console'
       };
     default:
       return null;
@@ -317,6 +353,19 @@ function renderFormFields(type, config = {}) {
         <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
       </div>
     `);
+  } else if (type === "groq") {
+    const model = config.model || "llama-3.3-70b-versatile";
+    formDynamicFields.insertAdjacentHTML('beforeend', `
+      <div class="bt-field">
+        <label>API Key</label>
+        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
+      </div>
+      <div class="bt-field">
+        <label>Model</label>
+        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="llama-3.3-70b-versatile" />
+        <small style="color: #666;">Lightning-fast inference (llama-3.3-70b-versatile, mixtral-8x7b, etc.)</small>
+      </div>
+    `);
   } else if (type === "ollama") {
     const model = config.model || "llama2";
     formDynamicFields.insertAdjacentHTML('beforeend', `
@@ -360,8 +409,9 @@ function renderFormFields(type, config = {}) {
 }
 
 function openProviderForm(provider = null) {
+  isNewProvider = !provider;
   editingProviderId = provider ? provider.id : null;
-  formTitle.textContent = provider ? "Edit Provider" : "Add Provider";
+  formTitle.textContent = provider ? i18n.t("popup.edit") : i18n.t("popup.addProvider");
   formType.value = provider ? provider.type : "gemini";
   formType.disabled = !!provider; // Cannot change type when editing
   formName.value = provider ? provider.name : "";
@@ -375,13 +425,69 @@ function openProviderForm(provider = null) {
   saveBtn.style.display = 'none';
 }
 
-function closeProviderForm() {
+function closeProviderForm(isCancel = false) {
+  if (isCancel && isNewProvider && editingProviderId) {
+    providers = providers.filter(p => p.id !== editingProviderId);
+    saveSettings();
+  }
   providerForm.hidden = true;
   providerListEl.parentElement.hidden = false;
   editingProviderId = null;
+  isNewProvider = false;
   
   // Show main save button
   saveBtn.style.display = 'block';
+  renderProviderList();
+}
+
+function autoSaveProviderForm() {
+  if (!isSettingsLoaded) return;
+  if (!providerForm || providerForm.hidden) return;
+  if (!providerForm || providerForm.hidden) return;
+
+  const type = formType ? formType.value : "gemini";
+  const name = formName ? (formName.value.trim() || type) : type;
+  const config = {};
+  
+  const apiKeyEl = document.querySelector("#field-apiKey");
+  if (apiKeyEl) config.apiKey = apiKeyEl.value.trim();
+  
+  const modelEl = document.querySelector("#field-model");
+  if (modelEl) config.model = modelEl.value.trim();
+  
+  const baseUrlEl = document.querySelector("#field-baseUrl");
+  if (baseUrlEl) config.baseUrl = baseUrlEl.value.trim();
+
+  if (editingProviderId) {
+    const idx = providers.findIndex(p => p.id === editingProviderId);
+    if (idx !== -1) {
+      providers[idx].name = name;
+      providers[idx].config = config;
+      saveSettings();
+    }
+  } else {
+    if (!editingProviderId) return; // Only auto-save when actively editing an existing form
+    // If adding a new provider and user typed an API key, baseUrl, or custom model/name
+    if (config.apiKey || config.baseUrl || (config.model && config.model.trim()) || (name && name !== type)) {
+      const newId = crypto.randomUUID();
+      editingProviderId = newId;
+      providers.push({
+        id: newId,
+        type,
+        name,
+        config
+      });
+      saveSettings();
+    }
+  }
+}
+
+let formAutoSaveTimer = null;
+function debouncedProviderFormAutoSave() {
+  if (formAutoSaveTimer) clearTimeout(formAutoSaveTimer);
+  formAutoSaveTimer = setTimeout(() => {
+    autoSaveProviderForm();
+  }, 250);
 }
 
 function saveProviderFromForm() {
@@ -393,7 +499,7 @@ function saveProviderFromForm() {
   if (apiKeyEl) config.apiKey = apiKeyEl.value.trim();
   
   const modelEl = document.querySelector("#field-model");
-  if (modelEl) config.model = modelEl.value;
+  if (modelEl) config.model = modelEl.value.trim();
   
   const baseUrlEl = document.querySelector("#field-baseUrl");
   if (baseUrlEl) config.baseUrl = baseUrlEl.value.trim();
@@ -414,19 +520,202 @@ function saveProviderFromForm() {
       name,
       config
     });
-    // If it's the first custom provider, maybe set it as default? No, keep builtin default.
   }
   
+  isNewProvider = false;
   saveSettings();
   renderProviderList();
-  closeProviderForm();
+  closeProviderForm(false);
 }
 
 // Event Listeners for Form
 btnAddProvider.addEventListener("click", () => openProviderForm(null));
-btnFormCancel.addEventListener("click", closeProviderForm);
+btnFormCancel.addEventListener("click", () => closeProviderForm(true));
 btnFormSave.addEventListener("click", saveProviderFromForm);
 formType.addEventListener("change", () => renderFormFields(formType.value));
+
+if (providerForm) {
+  providerForm.addEventListener("input", debouncedProviderFormAutoSave);
+  providerForm.addEventListener("change", autoSaveProviderForm);
+}
+
+// ============================================
+// TTS Provider Logic
+// ============================================
+
+const ttsProviderListEl = document.querySelector("#tts-provider-list");
+const btnAddTTSProvider = document.querySelector("#btn-add-tts-provider");
+const ttsProviderForm = document.querySelector("#tts-provider-form");
+const ttsFormTitle = document.querySelector("#tts-form-title");
+const ttsFormName = document.querySelector("#tts-form-name");
+const ttsFormUrl = document.querySelector("#tts-form-url");
+const btnTTSFormCancel = document.querySelector("#tts-form-cancel");
+const btnTTSFormSave = document.querySelector("#tts-form-save");
+
+function renderTTSProviderList() {
+  if (!ttsProviderListEl) return;
+  ttsProviderListEl.innerHTML = "";
+  
+  // Default Google TTS (cannot be deleted)
+  const googleTTS = { id: "google-tts", name: "Google TTS", type: "google", readonly: true };
+  
+  // Combine default and custom
+  const allProviders = [googleTTS, ...ttsProviders];
+  
+  allProviders.forEach(p => {
+    const isActive = p.id === activeTTSProviderId;
+    
+    const el = document.createElement("div");
+    el.className = `bt-provider-item ${isActive ? 'active' : ''}`;
+    
+    // Actions
+    let actionsHtml = '';
+    if (isActive) {
+      actionsHtml += `<span class="bt-badge-active">${i18n.t("popup.active")}</span>`;
+    } else {
+      actionsHtml += `<button class="bt-btn-text btn-set-active-tts" data-id="${p.id}">${i18n.t("popup.use")}</button>`;
+    }
+    
+    if (!p.readonly) {
+      actionsHtml += `<button class="bt-btn-text btn-edit-tts" data-id="${p.id}">${i18n.t("popup.edit")}</button>`;
+      actionsHtml += `<button class="bt-btn-text btn-delete-tts" data-id="${p.id}">${i18n.t("popup.delete")}</button>`;
+    }
+
+    el.innerHTML = `
+      <div class="bt-provider-info">
+        <div class="bt-provider-name">${p.name}</div>
+        <div class="bt-provider-type">${p.type === 'google' ? 'Standard' : 'Custom URL'}</div>
+      </div>
+      <div class="bt-provider-actions">
+        ${actionsHtml}
+      </div>
+    `;
+    ttsProviderListEl.appendChild(el);
+  });
+
+  // Attach events
+  ttsProviderListEl.querySelectorAll(".btn-set-active-tts").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      activeTTSProviderId = e.target.dataset.id;
+      renderTTSProviderList();
+      saveSettings();
+    });
+  });
+
+  ttsProviderListEl.querySelectorAll(".btn-delete-tts").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      if (confirm("Delete this TTS provider?")) {
+        ttsProviders = ttsProviders.filter(p => p.id !== e.target.dataset.id);
+        if (activeTTSProviderId === e.target.dataset.id) {
+          activeTTSProviderId = "google-tts";
+        }
+        renderTTSProviderList();
+        saveSettings();
+      }
+    });
+  });
+
+  ttsProviderListEl.querySelectorAll(".btn-edit-tts").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      const p = ttsProviders.find(item => item.id === e.target.dataset.id);
+      if (p) openTTSProviderForm(p);
+    });
+  });
+}
+
+function openTTSProviderForm(provider = null) {
+  isNewTTSProvider = !provider;
+  editingTTSProviderId = provider ? provider.id : null;
+  ttsFormTitle.textContent = provider ? "Edit TTS Provider" : "Add TTS Provider";
+  ttsFormName.value = provider ? provider.name : "";
+  ttsFormUrl.value = provider ? provider.url : "";
+  
+  ttsProviderListEl.parentElement.hidden = true;
+  ttsProviderForm.hidden = false;
+  saveBtn.style.display = 'none';
+}
+
+function closeTTSProviderForm(isCancel = false) {
+  if (isCancel && isNewTTSProvider && editingTTSProviderId) {
+    ttsProviders = ttsProviders.filter(p => p.id !== editingTTSProviderId);
+    saveSettings();
+  }
+  ttsProviderForm.hidden = true;
+  ttsProviderListEl.parentElement.hidden = false;
+  editingTTSProviderId = null;
+  isNewTTSProvider = false;
+  saveBtn.style.display = 'block';
+  renderTTSProviderList();
+}
+
+function autoSaveTTSForm() {
+  if (!isSettingsLoaded) return;
+  if (!ttsProviderForm || ttsProviderForm.hidden) return;
+  if (!ttsProviderForm || ttsProviderForm.hidden) return;
+
+  const name = ttsFormName ? (ttsFormName.value.trim() || "Custom TTS") : "Custom TTS";
+  const url = ttsFormUrl ? ttsFormUrl.value.trim() : "";
+  if (!url) return;
+
+  if (editingTTSProviderId) {
+    const idx = ttsProviders.findIndex(p => p.id === editingTTSProviderId);
+    if (idx !== -1) {
+      ttsProviders[idx].name = name;
+      ttsProviders[idx].url = url;
+      saveSettings();
+    }
+  } else {
+    const newId = crypto.randomUUID();
+    editingTTSProviderId = newId;
+    ttsProviders.push({
+      id: newId,
+      type: "custom",
+      name,
+      url
+    });
+    saveSettings();
+  }
+}
+
+function saveTTSProviderFromForm() {
+  const name = ttsFormName.value.trim() || "Custom TTS";
+  const url = ttsFormUrl.value.trim();
+  
+  if (!url) {
+    alert("URL Template is required");
+    return;
+  }
+
+  if (editingTTSProviderId) {
+    const idx = ttsProviders.findIndex(p => p.id === editingTTSProviderId);
+    if (idx !== -1) {
+      ttsProviders[idx].name = name;
+      ttsProviders[idx].url = url;
+    }
+  } else {
+    const newId = crypto.randomUUID();
+    ttsProviders.push({
+      id: newId,
+      type: "custom",
+      name,
+      url
+    });
+  }
+  
+  isNewTTSProvider = false;
+  saveSettings();
+  renderTTSProviderList();
+  closeTTSProviderForm(false);
+}
+
+if (btnAddTTSProvider) btnAddTTSProvider.addEventListener("click", () => openTTSProviderForm(null));
+if (btnTTSFormCancel) btnTTSFormCancel.addEventListener("click", () => closeTTSProviderForm(true));
+if (btnTTSFormSave) btnTTSFormSave.addEventListener("click", saveTTSProviderFromForm);
+
+if (ttsProviderForm) {
+  ttsProviderForm.addEventListener("input", autoSaveTTSForm);
+  ttsProviderForm.addEventListener("change", autoSaveTTSForm);
+}
 
 function updateSettingsVisibility() {
   if (enabledCheckbox.checked) {
@@ -438,7 +727,7 @@ function updateSettingsVisibility() {
 
 function toggleInstantSettings() {
   if (!instantEnabledCheckbox || !instantSettings) return;
-  
+
   if (instantEnabledCheckbox.checked) {
     instantSettings.removeAttribute('hidden');
   } else {
@@ -446,120 +735,284 @@ function toggleInstantSettings() {
   }
 }
 
+function updateShortcutPreview() {
+  if (!shortcutPreview) return;
+
+  const parts = [];
+  if (shortcutCtrlCheckbox.checked) parts.push('Ctrl');
+  if (shortcutShiftCheckbox.checked) parts.push('Shift');
+  if (shortcutAltCheckbox.checked) parts.push('Alt');
+
+  const key = shortcutKeyInput.value.toUpperCase() || 'I';
+  parts.push(key);
+
+  const shortcut = parts.join('+');
+  const macShortcut = shortcut.replace('Ctrl', 'Cmd');
+
+  shortcutPreview.textContent = `${shortcut} (${macShortcut} on Mac)`;
+}
+
 async function loadSettings() {
-  const res = await chrome.runtime.sendMessage({ type: "get-settings" });
+  let settings = null;
+
+  // 1. First priority: Read directly from chrome.storage.local
+  try {
+    const storageData = await chrome.storage.local.get("translatorSettings");
+    if (storageData && storageData.translatorSettings) {
+      settings = storageData.translatorSettings;
+    }
+  } catch (err) {
+    console.warn("TransKit popup: Failed to read from chrome.storage.local:", err);
+  }
+
+  // 2. Second priority: If chrome.storage.local is empty, fallback to background query
+  if (!settings) {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "get-settings" });
+      if (res?.ok && res.settings) {
+        settings = res.settings;
+      }
+    } catch (err) {
+      console.warn("TransKit popup: Failed to get settings from background:", err);
+    }
+  }
+
+  // 3. Fallback defaults only if absolutely no settings exist anywhere
+  if (!settings) {
+    settings = {
+      enabled: true,
+      nativeLanguageCode: "vi",
+      targetLanguageCode: "en",
+      useAutoDetect: false,
+      showConfirmModal: true,
+      aliases: {},
+      interfaceLanguage: "en",
+      instantTranslateEnabled: true,
+      instantDelay: 300,
+      instantExcludedDomains: [],
+      providers: [
+        { id: "google-translate", type: "google-translate", name: "Google Translate", config: {} },
+        { id: "builtin", type: "gemini-nano", name: "Chrome Built-in AI", config: {} }
+      ],
+      activeProviderId: "google-translate",
+      ttsProviders: [],
+      activeTTSProviderId: "google-tts",
+      customPrompt: "",
+      instantToggleShortcut: {
+        key: "I",
+        ctrl: true,
+        shift: true,
+        alt: false
+      },
+      hoverTranslateEnabled: false,
+      hoverUniqueMode: true,
+      hoverTranslateMode: "inject",
+      hoverModifierKey: "ctrl",
+      hoverTranslateGranularity: "line",
+      hoverToggleShortcut: { key: "O", ctrl: true, shift: true, alt: false },
+      hoverInjectStyle: {
+        textColor: "#0c69e4",
+        fontSize: "0.95em",
+        showIcon: true,
+        underline: false
+      },
+      hoverTranslateDomains: []
+    };
+  }
 
   populateSelects();
 
-  if (res?.ok) {
-    enabledCheckbox.checked = res.settings.enabled !== false;
-    nativeSelect.value = res.settings.nativeLanguageCode || "en";
-    targetSelect.value = res.settings.targetLanguageCode || "es";
-    timeoutInput.value = res.settings.dialogTimeout || 10;
-    preferNative.checked = res.settings.preferNativeAsSource !== false;
-    confirmModal.checked = res.settings.showConfirmModal !== false;
-    currentAliases = res.settings.aliases || {};
-    
-    const lang = res.settings.interfaceLanguage || "en";
-    updateLangToggleUI(lang);
-    i18n.setLanguage(lang);
-    populateSelects();
-    translateUI();
-    
-    if (instantEnabledCheckbox) {
-      instantEnabledCheckbox.checked = res.settings.instantTranslateEnabled || false;
-    }
-    if (instantDelayInput) {
-      instantDelayInput.value = (res.settings.instantDelay || 3000) / 1000;
-    }
-    currentDomains = res.settings.instantDomains || [];
-
-    // Load Providers
-    providers = res.settings.providers || [
-      { id: "builtin", type: "gemini-nano", name: "Chrome Built-in AI", config: {} }
-    ];
-    activeProviderId = res.settings.activeProviderId || "builtin";
-    
-    // Load Custom Prompt
-    if (userCustomPrompt) {
-      userCustomPrompt.value = res.settings.customPrompt || "";
-      updateCharCounter();
-    }
-    if (systemPromptDisplay) {
-      // Show user-friendly version of system prompt
-      systemPromptDisplay.value = "You are a professional translator. Translate the user's text from source language to target language. Return ONLY the translated text.";
-    }
-    
+  enabledCheckbox.checked = settings.enabled !== false;
+  nativeSelect.value = settings.nativeLanguageCode || "vi";
+  targetSelect.value = settings.targetLanguageCode || "en";
+  
+  // Migration: Convert old preferNativeAsSource to new useAutoDetect (reversed logic)
+  const oldValue = settings.preferNativeAsSource;
+  const newValue = settings.useAutoDetect;
+  if (newValue === undefined && oldValue !== undefined) {
+    autoDetect.checked = !oldValue;
   } else {
-    // Defaults
-    enabledCheckbox.checked = true;
-    nativeSelect.value = "en";
-    targetSelect.value = "es";
-    timeoutInput.value = 10;
-    preferNative.checked = true;
-    confirmModal.checked = true;
-    currentAliases = {};
-    
-    updateLangToggleUI("en");
-    i18n.setLanguage("en");
-    populateSelects();
-    translateUI();
-    
-    if (instantEnabledCheckbox) instantEnabledCheckbox.checked = false;
-    if (instantDelayInput) instantDelayInput.value = 3;
-    currentDomains = [];
-    
-    providers = [{ id: "builtin", type: "gemini-nano", name: "Chrome Built-in AI", config: {} }];
-    activeProviderId = "builtin";
-    
-    // Default custom prompt
-    if (userCustomPrompt) {
-      userCustomPrompt.value = "";
-      updateCharCounter();
-    }
-    if (systemPromptDisplay) {
-      // Show user-friendly version of system prompt
-      systemPromptDisplay.value = "You are a professional translator. Translate the user's text from source language to target language. Return ONLY the translated text.";
-    }
+    autoDetect.checked = newValue === true;
   }
   
+  confirmModal.checked = settings.showConfirmModal !== false;
+  currentAliases = settings.aliases || {};
+  
+  const lang = settings.interfaceLanguage || "en";
+  updateLangToggleUI(lang);
+  i18n.setLanguage(lang);
+  populateSelects();
+  translateUI();
+  
+  if (instantEnabledCheckbox) {
+    instantEnabledCheckbox.checked = settings.instantTranslateEnabled !== false;
+  }
+  if (instantDelayInput) {
+    instantDelayInput.value = settings.instantDelay || 300;
+  }
+  currentDomains = Array.isArray(settings.instantExcludedDomains) ? [...settings.instantExcludedDomains] : [];
+
+  // Load Providers (merge default providers if missing, NEVER wipe user providers or API keys)
+  if (Array.isArray(settings.providers) && settings.providers.length > 0) {
+    providers = [...settings.providers];
+    if (!providers.some(p => p.id === "builtin")) {
+      providers.push({ id: "builtin", type: "gemini-nano", name: "Chrome Built-in AI", config: {} });
+    }
+    if (!providers.some(p => p.id === "google-translate")) {
+      providers.unshift({ id: "google-translate", type: "google-translate", name: "Google Translate", config: {} });
+    }
+  } else {
+    providers = [
+      { id: "google-translate", type: "google-translate", name: "Google Translate", config: {} },
+      { id: "builtin", type: "gemini-nano", name: "Chrome Built-in AI", config: {} }
+    ];
+  }
+  activeProviderId = settings.activeProviderId || (providers[0] ? providers[0].id : "builtin");
+
+  // Load TTS Providers
+  ttsProviders = Array.isArray(settings.ttsProviders) ? [...settings.ttsProviders] : [];
+  activeTTSProviderId = settings.activeTTSProviderId || "google-tts";
+
+  // Load Custom Prompt
+  if (userCustomPrompt) {
+    userCustomPrompt.value = settings.customPrompt || "";
+    updateCharCounter();
+  }
+  if (systemPromptDisplay) {
+    systemPromptDisplay.value = "You are a professional translator. Translate the user's text from source language to target language. Return ONLY the translated text.";
+  }
+
+  // Load Keyboard Shortcut
+  const shortcut = settings.instantToggleShortcut || {
+    key: "I",
+    ctrl: true,
+    shift: true,
+    alt: false
+  };
+  if (shortcutCtrlCheckbox) shortcutCtrlCheckbox.checked = !!shortcut.ctrl;
+  if (shortcutShiftCheckbox) shortcutShiftCheckbox.checked = !!shortcut.shift;
+  if (shortcutAltCheckbox) shortcutAltCheckbox.checked = !!shortcut.alt;
+  if (shortcutKeyInput) shortcutKeyInput.value = (shortcut.key || "I").toUpperCase();
+  updateShortcutPreview();
+
+  // Load Hover Translate settings
+  if (hoverTranslateEnabled) hoverTranslateEnabled.checked = settings.hoverTranslateEnabled || false;
+  if (hoverUniqueMode) hoverUniqueMode.checked = settings.hoverUniqueMode !== false;
+  if (hoverSettings) hoverSettings.hidden = !hoverTranslateEnabled?.checked;
+  if (hoverMode) hoverMode.value = settings.hoverTranslateMode || 'inject';
+  if (hoverModifier) hoverModifier.value = settings.hoverModifierKey || 'ctrl';
+  if (hoverGranularity) hoverGranularity.value = settings.hoverTranslateGranularity || 'line';
+
+  // Load hover toggle shortcut
+  const hoverShortcut = settings.hoverToggleShortcut || { key: 'O', ctrl: true, shift: true, alt: false };
+  if (hoverShortcutCtrl) hoverShortcutCtrl.checked = !!hoverShortcut.ctrl;
+  if (hoverShortcutShift) hoverShortcutShift.checked = !!hoverShortcut.shift;
+  if (hoverShortcutAlt) hoverShortcutAlt.checked = !!hoverShortcut.alt;
+  if (hoverShortcutKey) hoverShortcutKey.value = (hoverShortcut.key || 'O').toUpperCase();
+  updateHoverShortcutPreview();
+
+  // Load style settings
+  const hoverStyle = settings.hoverInjectStyle || {};
+  if (hoverTextColor) hoverTextColor.value = hoverStyle.textColor || '#0c69e4';
+  if (hoverFontSize) hoverFontSize.value = hoverStyle.fontSize || '0.95em';
+  if (hoverShowIcon) hoverShowIcon.checked = hoverStyle.showIcon !== false;
+  if (hoverUnderline) hoverUnderline.checked = !!hoverStyle.underline;
+
+  // Load hover domains
+  currentHoverDomains = Array.isArray(settings.hoverTranslateDomains) ? [...settings.hoverTranslateDomains] : [];
+  renderHoverDomainList(currentHoverDomains);
+
   renderAliases();
   renderDomains();
   renderProviderList();
+  renderTTSProviderList();
   updateSettingsVisibility();
   toggleInstantSettings();
+
+  isSettingsLoaded = true;
 }
 
 async function saveSettings() {
+  if (!isSettingsLoaded) {
+    console.warn("TransKit popup: saveSettings skipped because settings are not loaded yet");
+    return;
+  }
+
   const settings = {
-    enabled: enabledCheckbox.checked,
-    nativeLanguageCode: nativeSelect.value,
-    targetLanguageCode: targetSelect.value,
-    dialogTimeout: parseInt(timeoutInput.value, 10) || 10,
-    preferNativeAsSource: preferNative.checked,
-    showConfirmModal: confirmModal.checked,
-    aliases: currentAliases,
-    interfaceLanguage: document.querySelector("#lang-toggle .active").getAttribute("data-lang"),
-    instantTranslateEnabled: instantEnabledCheckbox?.checked || false,
-    instantDelay: (parseInt(instantDelayInput?.value, 10) || 3) * 1000,
-    instantDomains: currentDomains,
+    enabled: enabledCheckbox ? enabledCheckbox.checked : true,
+    nativeLanguageCode: nativeSelect ? nativeSelect.value : "vi",
+    targetLanguageCode: targetSelect ? targetSelect.value : "en",
+    useAutoDetect: autoDetect ? autoDetect.checked : false,
+    showConfirmModal: confirmModal ? confirmModal.checked : true,
+    aliases: currentAliases || {},
+    interfaceLanguage: document.querySelector("#lang-toggle .active")?.getAttribute("data-lang") || "en",
+    instantTranslateEnabled: instantEnabledCheckbox?.checked !== false,
+    instantDelay: Math.max(200, parseInt(instantDelayInput?.value, 10) || 300),
+    instantExcludedDomains: currentDomains || [],
     // New Provider Structure
     providers,
     activeProviderId,
+    // TTS Settings
+    ttsProviders,
+    activeTTSProviderId,
     // Custom Prompt
-    customPrompt: userCustomPrompt?.value || ""
+    customPrompt: userCustomPrompt?.value || "",
+    // Keyboard shortcut
+    instantToggleShortcut: {
+      key: shortcutKeyInput?.value.toUpperCase() || "I",
+      ctrl: shortcutCtrlCheckbox?.checked || false,
+      shift: shortcutShiftCheckbox?.checked || false,
+      alt: shortcutAltCheckbox?.checked || false
+    },
+    // Hover Translate settings
+    hoverTranslateEnabled: hoverTranslateEnabled?.checked || false,
+    hoverUniqueMode: hoverUniqueMode?.checked !== false,
+    hoverTranslateMode: hoverMode?.value || 'inject',
+    hoverTranslateGranularity: hoverGranularity?.value || 'line',
+    hoverModifierKey: hoverModifier?.value || 'ctrl',
+    hoverToggleShortcut: {
+      key: hoverShortcutKey?.value.toUpperCase() || 'O',
+      ctrl: hoverShortcutCtrl?.checked || false,
+      shift: hoverShortcutShift?.checked || false,
+      alt: hoverShortcutAlt?.checked || false
+    },
+    hoverInjectStyle: {
+      textColor: hoverTextColor?.value || '#0c69e4',
+      fontSize: hoverFontSize?.value || '0.95em',
+      showIcon: hoverShowIcon?.checked !== false,
+      underline: hoverUnderline?.checked || false
+    },
+    hoverTranslateDomains: currentHoverDomains || []
   };
 
-  const res = await chrome.runtime.sendMessage({
-    type: "set-settings",
-    settings
-  });
+  // 1. Direct write to chrome.storage.local for immediate persistence:
+  try {
+    await chrome.storage.local.set({ translatorSettings: settings });
+  } catch (err) {
+    console.error("TransKit popup: storage.local.set error:", err);
+  }
 
-  if (res?.ok) {
-    saveBtn.textContent = i18n.t("popup.saved");
-    setTimeout(() => {
-      saveBtn.textContent = i18n.t("popup.savePreferences");
-    }, 1800);
+  // 2. Also notify background service worker:
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "set-settings",
+      settings
+    });
+
+    if (res?.ok && saveBtn) {
+      saveBtn.textContent = i18n.t("popup.saved");
+      setTimeout(() => {
+        saveBtn.textContent = i18n.t("popup.savePreferences");
+      }, 1800);
+    }
+  } catch (err) {
+    console.warn("TransKit popup: sendMessage set-settings warning:", err);
+    if (saveBtn) {
+      saveBtn.textContent = i18n.t("popup.saved");
+      setTimeout(() => {
+        saveBtn.textContent = i18n.t("popup.savePreferences");
+      }, 1800);
+    }
   }
 }
 
@@ -582,8 +1035,8 @@ enabledCheckbox.addEventListener("change", () => {
 
 nativeSelect.addEventListener("change", saveSettings);
 targetSelect.addEventListener("change", saveSettings);
-timeoutInput.addEventListener("change", saveSettings);
-preferNative.addEventListener("change", saveSettings);
+
+autoDetect.addEventListener("change", saveSettings);
 confirmModal.addEventListener("change", saveSettings);
 
 const langToggle = document.querySelector("#lang-toggle");
@@ -594,6 +1047,9 @@ langToggle.addEventListener("click", (e) => {
     i18n.setLanguage(lang);
     translateUI();
     populateSelects();
+    renderAliases();
+    renderDomains();
+    renderProviderList();
     updateLangToggleUI(lang);
     saveSettings();
   }
@@ -624,12 +1080,44 @@ if (addDomainBtn && newDomainInput) {
   addDomainBtn.addEventListener("click", () => {
     const domain = newDomainInput.value.trim();
     if (domain && !currentDomains.some(d => d.domain === domain)) {
-      currentDomains.push({ domain, enabled: true, position: 'bottom' });
+      currentDomains.push({ domain, enabled: true, position: 'auto' });
       newDomainInput.value = "";
       renderDomains();
       saveSettings();
     }
   });
+}
+
+// Keyboard Shortcut Event Listeners
+if (shortcutCtrlCheckbox) {
+  shortcutCtrlCheckbox.addEventListener("change", () => {
+    updateShortcutPreview();
+    saveSettings();
+  });
+}
+
+if (shortcutShiftCheckbox) {
+  shortcutShiftCheckbox.addEventListener("change", () => {
+    updateShortcutPreview();
+    saveSettings();
+  });
+}
+
+if (shortcutAltCheckbox) {
+  shortcutAltCheckbox.addEventListener("change", () => {
+    updateShortcutPreview();
+    saveSettings();
+  });
+}
+
+if (shortcutKeyInput) {
+  shortcutKeyInput.addEventListener("input", (e) => {
+    // Only allow single letter
+    e.target.value = e.target.value.replace(/[^a-zA-Z]/g, '').toUpperCase().slice(0, 1);
+    updateShortcutPreview();
+  });
+
+  shortcutKeyInput.addEventListener("change", saveSettings);
 }
 
 document.querySelectorAll('.bt-tab').forEach(tab => {
@@ -638,7 +1126,18 @@ document.querySelectorAll('.bt-tab').forEach(tab => {
     document.querySelectorAll('.bt-tab-content').forEach(c => c.classList.remove('active'));
     
     tab.classList.add('active');
-    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+    const contentId = 'tab-' + tab.dataset.tab;
+    document.getElementById(contentId).classList.add('active');
+
+    // Hide save button on help tab
+    if (tab.dataset.tab === 'help') {
+      saveBtn.style.display = 'none';
+    } else {
+      // Only show if not in provider form
+      if (providerForm.hidden && ttsProviderForm.hidden) {
+        saveBtn.style.display = 'block';
+      }
+    }
   });
 });
 
@@ -658,4 +1157,134 @@ if (userCustomPrompt) {
   });
 }
 
+// Hover Translate Event Listeners
+if (hoverTranslateEnabled) {
+  hoverTranslateEnabled.addEventListener('change', () => {
+    hoverSettings.hidden = !hoverTranslateEnabled.checked;
+    saveSettings();
+  });
+}
+
+// Auto-save for other hover settings
+if (hoverUniqueMode) hoverUniqueMode.addEventListener('change', saveSettings);
+if (hoverShowIcon) hoverShowIcon.addEventListener('change', saveSettings);
+if (hoverUnderline) hoverUnderline.addEventListener('change', saveSettings);
+if (hoverFontSize) hoverFontSize.addEventListener('change', saveSettings);
+if (hoverTextColor) hoverTextColor.addEventListener('change', saveSettings);
+if (hoverMode) hoverMode.addEventListener('change', saveSettings);
+if (hoverGranularity) hoverGranularity.addEventListener('change', saveSettings);
+if (hoverModifier) hoverModifier.addEventListener('change', saveSettings);
+
+if (manageHoverDomains) {
+  manageHoverDomains.addEventListener('click', () => {
+    hoverDomainListSection.hidden = !hoverDomainListSection.hidden;
+  });
+}
+
+if (addHoverDomain) {
+  addHoverDomain.addEventListener('click', async () => {
+    const domain = newHoverDomain.value.trim();
+    if (!domain) return;
+    
+    if (!currentHoverDomains) {
+      currentHoverDomains = [];
+    }
+    
+    if (!currentHoverDomains.find(d => d.domain === domain)) {
+      currentHoverDomains.push({ domain, enabled: true });
+      renderHoverDomainList(currentHoverDomains);
+      newHoverDomain.value = '';
+      await saveSettings();
+    }
+  });
+}
+
+if (hoverShortcutCtrl && hoverShortcutShift && hoverShortcutAlt && hoverShortcutKey) {
+  [hoverShortcutCtrl, hoverShortcutShift, hoverShortcutAlt, hoverShortcutKey].forEach(el => {
+    el.addEventListener('change', updateHoverShortcutPreview);
+    el.addEventListener('input', updateHoverShortcutPreview);
+  });
+}
+
+// Hover Translate Helper Functions
+function updateHoverShortcutPreview() {
+  if (!hoverShortcutPreview) return;
+  const parts = [];
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+  
+  if (hoverShortcutCtrl?.checked) parts.push(isMac ? 'Cmd' : 'Ctrl');
+  if (hoverShortcutShift?.checked) parts.push('Shift');
+  if (hoverShortcutAlt?.checked) parts.push('Alt');
+  parts.push(hoverShortcutKey?.value.toUpperCase() || 'H');
+  
+  hoverShortcutPreview.textContent = parts.join('+');
+}
+
+function renderHoverDomainList(domains) {
+  if (!hoverDomainList) return;
+  hoverDomainList.innerHTML = '';
+  if (hoverDomainCount) hoverDomainCount.textContent = (domains || []).length;
+  
+  (domains || []).forEach((d, index) => {
+    const item = document.createElement('div');
+    item.className = 'bt-domain-item';
+    item.innerHTML = `
+      <div class="bt-domain-info">
+        <span class="bt-domain-name">${d.domain}</span>
+      </div>
+      <div class="bt-domain-actions">
+        <label class="bt-domain-toggle">
+          <input type="checkbox" ${d.enabled ? 'checked' : ''} data-index="${index}" class="hover-domain-toggle">
+          <span>Active</span>
+        </label>
+        <button class="bt-button-icon remove-hover-domain" data-index="${index}">×</button>
+      </div>
+    `;
+    hoverDomainList.appendChild(item);
+  });
+  
+  document.querySelectorAll('.hover-domain-toggle').forEach(toggle => {
+    toggle.addEventListener('change', async (e) => {
+      const index = parseInt(e.target.dataset.index, 10);
+      if (currentHoverDomains[index]) {
+        currentHoverDomains[index].enabled = e.target.checked;
+        await saveSettings();
+      }
+    });
+  });
+  
+  document.querySelectorAll('.remove-hover-domain').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const index = parseInt(e.target.dataset.index, 10);
+      if (currentHoverDomains[index]) {
+        currentHoverDomains.splice(index, 1);
+        renderHoverDomainList(currentHoverDomains);
+        await saveSettings();
+      }
+    });
+  });
+}
+
+// Window and mouse listeners - only run if forms are active and dirty
+window.addEventListener("blur", () => {
+  if (providerForm && !providerForm.hidden && editingProviderId) autoSaveProviderForm();
+  if (ttsProviderForm && !ttsProviderForm.hidden && editingTTSProviderId) autoSaveTTSForm();
+});
+
+document.addEventListener("mouseleave", () => {
+  if (providerForm && !providerForm.hidden && editingProviderId) autoSaveProviderForm();
+  if (ttsProviderForm && !ttsProviderForm.hidden && editingTTSProviderId) autoSaveTTSForm();
+});
+
+window.addEventListener("pagehide", () => {
+  autoSaveProviderForm();
+  autoSaveTTSForm();
+});
+
+window.addEventListener("beforeunload", () => {
+  autoSaveProviderForm();
+  autoSaveTTSForm();
+});
+
 loadSettings();
+displayVersion();
