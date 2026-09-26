@@ -513,6 +513,9 @@ function removeTranslationCommandSuffix(element) {
   return "";
 }
 
+let lastToastMessage = "";
+let lastToastAt = 0;
+
 function showToast(message) {
   // Extension context invalidation is normal lifecycle noise (extension
   // reload/update); clean up silently instead of alarming the user.
@@ -521,6 +524,12 @@ function showToast(message) {
     cleanupExtensionElements();
     return;
   }
+  // Identical messages repeat fast when a site fires many input events;
+  // showing them once per 4 seconds is enough.
+  const now = Date.now();
+  if (message === lastToastMessage && now - lastToastAt < 4000) return;
+  lastToastMessage = message;
+  lastToastAt = now;
   const host = document.createElement("div");
   const lowerMsg = message.toLowerCase();
 

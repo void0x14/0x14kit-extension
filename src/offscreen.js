@@ -122,65 +122,80 @@ async function runTranslation(
     }
   }
 
-  // Bidirectional check: finalSource and target cannot be the same (tr -> tr or en -> en).
-  // If same, switch target to the opposite language (en or tr) before calling Translator.create
-  if (finalSource === target) {
-    if (target === "tr") {
-      target = "en";
-    } else if (target === "en") {
-      target = "tr";
-    } else {
-      target = finalSource === "en" ? "tr" : "en";
+  // Candidate sources, in order: detected language, requested source,
+  // heuristic fallback. Chrome's Translator rejects unsupported codes at
+  // create() — so every candidate is availability-checked first and a
+  // rejected one never aborts the request (the next candidate runs).
+  const sanitize = (code) => {
+    if (!code) return null;
+    const c = String(code).toLowerCase();
+    if (c.startsWith("zh")) {
+      if (c.includes("tw") || c.includes("hant")) return "zh-TW";
+      return "zh";
     }
-    if (finalSource === target) {
-      finalSource = target === "en" ? "tr" : "en";
-    }
+    return c.split("-")[0];
+  };
+
+  const normTarget = target;
+  const requested = sanitize(source);
+  const detectedSan = sanitize(finalSource && finalSource !== "auto" ? finalSource : null);
+
+  const candidates = [];
+  const addCandidate = (c) => {
+    if (!c || c === normTarget) return;
+    if (!candidates.includes(c)) candidates.push(c);
+  };
+  addCandidate(detectedSan);
+  addCandidate(requested);
+  addCandidate(normTarget === "tr" ? "en" : normTarget === "en" ? "tr" : null);
+
+  if (candidates.length === 0) {
+    // Text is (probably) already in the target language: flip the direction
+    // so the user still gets a useful translation.
+    const flipped = normTarget === "tr" ? "en" : "en";
+    addCandidate(flipped === normTarget ? "tr" : flipped);
   }
 
-  const pairSource = finalSource;
-  const availability = await getAvailabilityForPair(pairSource, target);
-
-  if (availability === "unsupported")
-    return {
-      ok: false,
-      error: `Language pair ${pairSource} -> ${target} is not supported by Chrome Built-in AI.`
-    };
-
+  const TranslatorAPI2 = TranslatorAPI;
   let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      // create() can transiently fail (language pack download race, repeated
-      // creates for the same pair); one retry covers it.
-      if (attempt > 0) {
-        await new Promise((r) => setTimeout(r, 500));
-        const retryAvail = await getAvailabilityForPair(pairSource, target);
-        if (retryAvail === "unsupported") {
-          return { ok: false, error: `Language pair ${pairSource} -> ${target} is not supported by Chrome Built-in AI.` };
+
+  for (const pairSource of candidates) {
+    const availability = await getAvailabilityForPair(pairSource, normTarget);
+    if (availability === "unsupported") continue;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, 500));
+          const retryAvail = await getAvailabilityForPair(pairSource, normTarget);
+          if (retryAvail === "unsupported") break;
         }
+        const translator = await TranslatorAPI2.create({
+          sourceLanguage: pairSource,
+          targetLanguage: normTarget,
+          monitor(m) {
+            m.addEventListener("downloadprogress", () => {});
+          }
+        });
+        const translated = await translator.translate(text);
+        return {
+          ok: true,
+          translation: translated,
+          sourceLanguage: pairSource,
+          targetLanguage: normTarget
+        };
+      } catch (e) {
+        lastError = e;
       }
-      const translator = await TranslatorAPI.create({
-        sourceLanguage: pairSource,
-        targetLanguage: target,
-        monitor(m) {
-          m.addEventListener("downloadprogress", () => {});
-        }
-      });
-
-      const translated = await translator.translate(text);
-
-      return {
-        ok: true,
-        translation: translated,
-        sourceLanguage: finalSource || "auto",
-        targetLanguage: target
-      };
-    } catch (e) {
-      lastError = e;
     }
   }
+
+  const pairText = candidates.length
+    ? `${candidates.join(", ")} -> ${normTarget}`
+    : `? -> ${normTarget}`;
   return {
     ok: false,
-    error: String(lastError?.message || lastError || "Translation failed")
+    error: `Chrome yerel cevirisi bu dil ciftini desteklemiyor (${pairText}).`
   };
 }
 
