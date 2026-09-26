@@ -54,8 +54,8 @@ const DEFAULT_SETTINGS = {
   instantPosition: "auto",
   instantExcludedDomains: [],
   migratedAllSites: true,
-  // AI Provider settings
-  activeProviderId: "google-translate",
+  // AI Provider settings — local on-device Nano is the default; no API keys
+  activeProviderId: "builtin",
   providers: [
     {
       id: "google-translate",
@@ -328,21 +328,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
             sendResponse({ ok: true, result: resultObj });
           } else if (providerType === "gemini-nano" || providerType === "builtin") {
-            // Local Nano unavailable for this pair (model missing / unsupported):
-            // fall back to the free Google endpoint so translation still works.
-            console.warn("TransKit background: builtin failed, falling back to google-translate:", offscreenResult?.error);
-            const gtProvider = settings.providers?.find(p => p.type === "google-translate");
-            const gtResult = await aiService.translate(textToTranslate, sourceLang, targetLang, gtProvider?.id);
-            sendResponse({
-              ok: true,
-              result: {
-                translation: gtResult?.translation,
-                providerName: "Google Translate (fallback)",
-                providerType: "google-translate",
-                sourceLanguage: sourceLang,
-                targetLanguage: gtResult?.detectedSource === targetCodeNorm ? nativeCode : targetLang
-              }
-            });
+            // Nano-only policy: only rescue when the on-device Translator API
+            // does not exist at all (old browser builds). Pair/model problems
+            // surface as errors instead of silently switching engines.
+            const errText = String(offscreenResult?.error || "");
+            if (/not supported/i.test(errText)) {
+              console.warn("TransKit background: Translator API absent, using google-translate fallback");
+              const gtProvider = settings.providers?.find(p => p.type === "google-translate");
+              const gtResult = await aiService.translate(textToTranslate, sourceLang, targetLang, gtProvider?.id);
+              sendResponse({
+                ok: true,
+                result: {
+                  translation: gtResult?.translation,
+                  providerName: "Google Translate (fallback)",
+                  providerType: "google-translate",
+                  sourceLanguage: sourceLang,
+                  targetLanguage: gtResult?.detectedSource === targetCodeNorm ? nativeCode : targetLang
+                }
+              });
+            } else {
+              sendResponse({ ok: false, error: errText || "Unknown offscreen error" });
+            }
           } else {
             sendResponse({ ok: false, error: offscreenResult?.error || "Unknown offscreen error" });
           }

@@ -632,34 +632,42 @@ async function handleAutoTranslation(element, parsed) {
     const resolvedSourceLang = (targetCode === nativeCode) ? defaultTargetCode : nativeCode;
 
     const cleanSourceValue = removeTranslationCommandSuffix(element);
-    
+
+    // Quote-aware payload: only own words get translated
+    const payloadBase = {
+      sourceLanguage: resolvedSourceLang,
+      nativeLanguageCode: nativeCode,
+      targetLanguage: targetCode,
+      useAutoDetect: settings.useAutoDetect === true,
+      flipOnSameLanguage: true
+    };
+
     // If confirm is OFF, just translate and replace immediately
     if (!settings.showConfirmModal) {
       // Only show loading for non-builtin models
       if (settings.activeProviderId !== "builtin") {
         showToast(i18n.t("toast.translating"));
       }
-      let res;
+      let out;
       try {
-        res = await requestTranslation({
-          text: cleanSourceValue,
-          sourceLanguage: resolvedSourceLang,
-          nativeLanguageCode: nativeCode,
-          targetLanguage: targetCode,
-          useAutoDetect: settings.useAutoDetect === true,
-          flipOnSameLanguage: true
-        });
+        out = await translateFieldOwnText(cleanSourceValue, payloadBase);
       } catch (e) {
         showToast(e?.message ? String(e.message) : i18n.t("toast.translationFailed"));
         return;
       }
 
-      if (res?.contextInvalidated) return;
+      if (out?.res?.contextInvalidated) return;
 
-      if (res?.ok && res.result?.translation) {
-        setFieldText(element, res.result.translation);
+      if (out?.failed) {
+        showToast(out.res?.error || i18n.t("toast.translationFailed"));
+        return;
+      }
+      if (out?.ok && out.translation) {
+        setFieldText(element, out.translation);
+      } else if (out?.skipped) {
+        // nothing own to translate — leave the field untouched
       } else {
-        showToast(res?.error ? String(res.error) : i18n.t("toast.translationFailed"));
+        showToast(i18n.t("toast.translationFailed"));
       }
       return;
     }
@@ -670,33 +678,28 @@ async function handleAutoTranslation(element, parsed) {
       showToast(i18n.t("toast.translating"));
     }
 
-    let res;
+    let out;
     try {
-      res = await requestTranslation({
-        text: cleanSourceValue,
-        sourceLanguage: resolvedSourceLang,
-        nativeLanguageCode: nativeCode,
-        targetLanguage: targetCode,
-        useAutoDetect: settings.useAutoDetect === true,
-        flipOnSameLanguage: true
-      });
+      out = await translateFieldOwnText(cleanSourceValue, payloadBase);
     } catch (e) {
       showToast(e?.message ? String(e.message) : i18n.t("toast.translationFailed"));
       return;
     }
 
-    if (res?.contextInvalidated) return;
+    if (out?.res?.contextInvalidated) return;
 
-    if (!res || !res.ok || !res.result?.translation) {
-      showToast(res?.error ? String(res.error) : i18n.t("toast.translationFailed"));
+    if (!out?.ok || !out.translation) {
+      showToast(out?.failed && out.res?.error ? String(out.res.error) : i18n.t("toast.translationFailed"));
       return;
     }
 
-    const translation = res.result.translation;
-    const providerInfo = `${res.result.providerName || 'AI'} (${res.result.providerType || 'Bot'})`;
+    const translation = out.translation;
+    const providerInfo = `${out.meta.providerName || 'AI'} (${out.meta.providerType || 'Bot'})`;
 
     // Use buildInlineSuggestion with auto positioning
     suggestion = buildInlineSuggestion(element, translation, providerInfo, 'auto');
+    suggestion._segments = out.segments;
+    suggestion._ownJoined = out.ownJoined;
     
     // Setup Tab/Esc handlers
     const handleKeydown = (ev) => {
@@ -746,6 +749,76 @@ function isInstantDomain(settings) {
   return isInstantAllowed(settings)
     ? { position: settings.instantPosition || "auto" }
     : null;
+}
+
+// ============================================
+// QUOTE-AWARE SEGMENTATION
+// ============================================
+// When replying on a forum the field usually contains quoted material
+// ([quote] BBCode, > markdown lines, <blockquote> HTML) plus the user's own
+// words. Only the user's own words may be translated — quoted authors' text
+// must pass through untouched. This is message-format logic, generic for all
+// sites, never site-specific.
+
+function segmentQuotedText(text) {
+  const segments = [];
+  const push = (type, start, end) => {
+    if (end > start) segments.push({ type, text: text.slice(start, end) });
+  };
+
+  const ranges = [];
+  let m;
+
+  // BBCode quotes: [quote], [quote=author], [quote=author date]...[/quote]
+  const bb = /\[quote[^\]]*\][\s\S]*?(?:\[\/quote\]|$)/gi;
+  while ((m = bb.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+
+  // HTML blockquotes (rich editors that keep serialized HTML)
+  const bq = /<blockquote[\s\S]*?<\/blockquote>|<blockquote[^>]*>[\s\S]*$/gi;
+  while ((m = bq.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+
+  // Markdown / Discord quote lines: lines starting with >
+  if (ranges.length === 0) {
+    const lineRe = /(?:^|\n)[ \t]{0,3}>[^\n]*/g;
+    while ((m = lineRe.exec(text))) {
+      let start = m.index;
+      if (text[start] === "\n") start += 1;
+      ranges.push([start, m.index + m[0].length]);
+    }
+  }
+
+  if (ranges.length === 0) return [{ type: "own", text }];
+
+  // Merge overlapping ranges, then split into quote/own segments
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
+  }
+
+  let pos = 0;
+  for (const [s, e] of merged) {
+    push("own", pos, s);
+    push("quote", s, e);
+    pos = e;
+  }
+  push("own", pos, text.length);
+  return segments;
+}
+
+function ownSegments(segments) {
+  return segments.filter((s) => s.type === "own" && s.text.trim().length > 0);
+}
+
+// Rebuild the full field text: quoted segments untouched, own segments
+// replaced by their translations (aligned 1:1 in order).
+function rebuildWithTranslations(segments, translatedOwn) {
+  let i = 0;
+  return segments
+    .map((s) => (s.type === "own" && s.text.trim().length > 0 ? translatedOwn[i++] : s.text))
+    .join("");
 }
 
 function stripInvisibleChars(text) {
@@ -1257,6 +1330,44 @@ async function commitIMEComposition(element) {
   }
 }
 
+// Translate ONLY the user's own words in a field. Quoted segments pass
+// through untouched and are spliced back around the translated own text.
+async function translateFieldOwnText(rawText, payloadBase) {
+  const segments = segmentQuotedText(rawText);
+  const own = ownSegments(segments);
+  if (own.length === 0) return { skipped: true };
+
+  const joined = own.map((s) => s.text.trim()).join("\n\n");
+  const res = await requestTranslation({ ...payloadBase, text: joined });
+  if (!res?.ok || !res.result?.translation) return { failed: true, res };
+
+  const parts = res.result.translation.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+  let translatedOwn;
+  if (parts.length === own.length) {
+    translatedOwn = parts;
+  } else if (own.length === 1) {
+    translatedOwn = [res.result.translation.trim()];
+  } else {
+    // Alignment failed (paragraph count changed) — translate each own
+    // segment separately so quotes and own text never mix up.
+    translatedOwn = [];
+    for (const s of own) {
+      const r = await requestTranslation({ ...payloadBase, text: s.text.trim() });
+      if (!r?.ok || !r.result?.translation) return { failed: true, res: r };
+      translatedOwn.push(r.result.translation.trim());
+    }
+  }
+
+  return {
+    ok: true,
+    translation: rebuildWithTranslations(segments, translatedOwn),
+    ownJoined: joined,
+    segments,
+    ownCount: own.length,
+    meta: res.result
+  };
+}
+
 async function handleInstantTranslate(element) {
   // Skip if we just applied a translation
   if (justAppliedTranslation) return;
@@ -1269,6 +1380,12 @@ async function handleInstantTranslate(element) {
 
   const text = stripInvisibleChars(element.value || element.innerText || "");
   if (!shouldTriggerInstant(text)) return;
+
+  // Quote-aware: only the user's own words count for the trigger
+  const preSegments = segmentQuotedText(text);
+  const preOwn = ownSegments(preSegments);
+  if (preOwn.length === 0) return; // field contains only quoted material
+  if (!preOwn.some((s) => shouldTriggerInstant(s.text))) return;
 
   let settings;
   try {
@@ -1309,15 +1426,17 @@ async function handleInstantTranslate(element) {
         freshText = freshText.replace(TRANSLATION_COMMAND_PATTERN, "").trimEnd();
       }
 
-      if (!shouldTriggerInstant(freshText)) return;
+      // Quote-aware: skip when nothing own is left to translate
+      const preSegs = segmentQuotedText(freshText);
+      const preOwnSegs = ownSegments(preSegs);
+      if (preOwnSegs.length === 0 || !preOwnSegs.some((s) => shouldTriggerInstant(s.text))) return;
 
       // Only show loading for non-builtin models
       if (settings.activeProviderId !== "builtin") {
         showToast(i18n.t("toast.translating"));
       }
 
-      const res = await requestTranslation({
-        text: freshText,
+      const out = await translateFieldOwnText(freshText, {
         nativeLanguageCode: settings.nativeLanguageCode || "en",
         targetLanguage: settings.targetLanguageCode || "en",
         sourceLanguage: settings.nativeLanguageCode || "en", // Preferred direction: native -> target
@@ -1327,22 +1446,24 @@ async function handleInstantTranslate(element) {
 
       if (!element.isConnected) return;
 
-      if (res?.ok && res.result?.translation) {
-        // Use 'auto' by default for smart positioning
-        const position = domainConfig.position || 'auto';
-        const providerInfo = `${res.result.providerName || 'AI'} (${res.result.providerType || 'Bot'})`;
-        currentSuggestion = buildInlineSuggestion(element, res.result.translation, providerInfo, position, settings);
-        setupSuggestionKeyHandlers(element, currentSuggestion);
+      if (out?.failed) {
+        showToast(out.res?.error || i18n.t("toast.translationFailed"));
+        return;
+      }
+      if (!out?.ok) return;
 
-        // Handle provider change
-        if (currentSuggestion.providerSelect) {
-          currentSuggestion.providerSelect.addEventListener('change', (e) => {
-            reTranslateSuggestion(element, text, e.target.value, settings);
-          });
-        }
-      } else {
-        // Show error toast when translation fails
-        showToast(res?.error || i18n.t("toast.translationFailed"));
+      const position = domainConfig.position || 'auto';
+      const providerInfo = `${out.meta.providerName || 'AI'} (${out.meta.providerType || 'Bot'})`;
+      currentSuggestion = buildInlineSuggestion(element, out.translation, providerInfo, position, settings);
+      currentSuggestion._segments = out.segments;
+      currentSuggestion._ownJoined = out.ownJoined;
+      setupSuggestionKeyHandlers(element, currentSuggestion);
+
+      // Handle provider change
+      if (currentSuggestion.providerSelect) {
+        currentSuggestion.providerSelect.addEventListener('change', (e) => {
+          reTranslateSuggestion(element, out.ownJoined, e.target.value, settings);
+        });
       }
     } catch (err) {
       console.error("Instant translate error:", err);
@@ -1351,30 +1472,40 @@ async function handleInstantTranslate(element) {
   }, Math.max(200, settings.instantDelay || 300));
 }
 
-async function reTranslateSuggestion(element, text, providerId, settings) {
+async function reTranslateSuggestion(element, ownJoinedText, providerId, settings) {
   if (!currentSuggestion) return;
-  
+
   const textEl = currentSuggestion.element.querySelector('.bt-suggestion-text');
   if (textEl) {
     textEl.textContent = i18n.t("dialog.translating");
     textEl.classList.add('bt-loading-text');
   }
-  
+
   try {
     const res = await requestTranslation({
-      text: text,
+      text: ownJoinedText,
       nativeLanguageCode: settings.nativeLanguageCode || "en",
       targetLanguage: settings.targetLanguageCode || "es",
       useAutoDetect: settings.useAutoDetect === true,
+      flipOnSameLanguage: true,
       providerId: providerId
     });
-    
+
     if (res?.ok && res.result?.translation) {
+      // Rebuild around quotes so provider switching never leaks quotes
+      let final = res.result.translation;
+      if (currentSuggestion._segments && ownSegments(currentSuggestion._segments).length > 0) {
+        const parts = final.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+        const own = ownSegments(currentSuggestion._segments);
+        if (parts.length === own.length) {
+          final = rebuildWithTranslations(currentSuggestion._segments, parts);
+        }
+      }
       if (textEl) {
-        textEl.textContent = res.result.translation;
+        textEl.textContent = final;
         textEl.classList.remove('bt-loading-text');
       }
-      currentSuggestion.translatedText = res.result.translation;
+      currentSuggestion.translatedText = final;
     }
   } catch (err) {
     console.error("Re-translation error:", err);
