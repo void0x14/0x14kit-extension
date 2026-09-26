@@ -146,29 +146,42 @@ async function runTranslation(
       error: `Language pair ${pairSource} -> ${target} is not supported by Chrome Built-in AI.`
     };
 
-  try {
-    const translator = await TranslatorAPI.create({
-      sourceLanguage: pairSource,
-      targetLanguage: target,
-      monitor(m) {
-        m.addEventListener("downloadprogress", () => {});
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      // create() can transiently fail (language pack download race, repeated
+      // creates for the same pair); one retry covers it.
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 500));
+        const retryAvail = await getAvailabilityForPair(pairSource, target);
+        if (retryAvail === "unsupported") {
+          return { ok: false, error: `Language pair ${pairSource} -> ${target} is not supported by Chrome Built-in AI.` };
+        }
       }
-    });
+      const translator = await TranslatorAPI.create({
+        sourceLanguage: pairSource,
+        targetLanguage: target,
+        monitor(m) {
+          m.addEventListener("downloadprogress", () => {});
+        }
+      });
 
-    const translated = await translator.translate(text);
+      const translated = await translator.translate(text);
 
-    return {
-      ok: true,
-      translation: translated,
-      sourceLanguage: finalSource || "auto",
-      targetLanguage: target
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      error: String(e?.message || e || "Translation failed")
-    };
+      return {
+        ok: true,
+        translation: translated,
+        sourceLanguage: finalSource || "auto",
+        targetLanguage: target
+      };
+    } catch (e) {
+      lastError = e;
+    }
   }
+  return {
+    ok: false,
+    error: String(lastError?.message || lastError || "Translation failed")
+  };
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

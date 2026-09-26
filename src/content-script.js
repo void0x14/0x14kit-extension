@@ -17,6 +17,8 @@ function btSafeRoot() {
 
 let isTranslating = false;
 let translatingTimeout = null;
+let lastAppliedText = "";
+let lastAppliedAt = 0;
 let debounceTimer = null;
 
 // Helper function to check if extension context is valid
@@ -512,6 +514,13 @@ function removeTranslationCommandSuffix(element) {
 }
 
 function showToast(message) {
+  // Extension context invalidation is normal lifecycle noise (extension
+  // reload/update); clean up silently instead of alarming the user.
+  if (String(message || "").includes("Extension context invalidated")) {
+    console.info("TransKit: context invalidated; detaching silently");
+    cleanupExtensionElements();
+    return;
+  }
   const host = document.createElement("div");
   const lowerMsg = message.toLowerCase();
 
@@ -664,6 +673,8 @@ async function handleAutoTranslation(element, parsed) {
       }
       if (out?.ok && out.translation) {
         setFieldText(element, out.translation);
+        lastAppliedText = stripInvisibleChars(out.translation || "");
+        lastAppliedAt = Date.now();
       } else if (out?.skipped) {
         // nothing own to translate — leave the field untouched
       } else {
@@ -1337,6 +1348,8 @@ function setupSuggestionKeyHandlers(element, suggestion) {
     // of a handled keydown ("bogus text replacement" guard).
     setTimeout(() => {
       setFieldText(element, suggestion.translatedText, { immediate: true });
+      lastAppliedText = stripInvisibleChars(suggestion.translatedText || "");
+      lastAppliedAt = Date.now();
     }, 0);
 
     // Destroy popup after a tiny delay to ensure insertion completes
@@ -1347,10 +1360,11 @@ function setupSuggestionKeyHandlers(element, suggestion) {
       currentSuggestion = null;
     }, 50);
 
-    // Clear flag after a short delay
+    // Clear flag after a short delay (editors reconcile async; keep the
+    // suppression window long enough to cover their input events)
     setTimeout(() => {
       justAppliedTranslation = false;
-    }, 500);
+    }, 1500);
   };
 
   const dismiss = () => {
@@ -1444,6 +1458,11 @@ async function handleInstantTranslate(element) {
   const text = stripInvisibleChars(element.value || element.innerText || "");
   if (!shouldTriggerInstant(text)) return;
 
+  // Suppress re-triggering on our own applied translation: editors fire
+  // their own async input events after we replace the text (often later
+  // than the 500ms justAppliedTranslation window).
+  if (text === lastAppliedText && Date.now() - lastAppliedAt < 2500) return;
+
   // Quote-aware: only the user's own words count for the trigger
   const preSegments = segmentQuotedText(text);
   const preOwn = ownSegments(preSegments);
@@ -1509,6 +1528,7 @@ async function handleInstantTranslate(element) {
 
       if (!element.isConnected) return;
 
+      if (out?.res?.contextInvalidated) { cleanupExtensionElements(); return; }
       if (out?.failed) {
         showToast(out.res?.error || i18n.t("toast.translationFailed"));
         return;
@@ -1640,6 +1660,28 @@ function registerInstantMode() {
     }
   });
   
+  // Any editing keypress while a suggestion is visible kills it immediately,
+  // so the popup never hangs around while the user deletes/edits text (this
+  // covers editors that never fire native input events, like SCEditor).
+  document.addEventListener('keydown', (e) => {
+    if (!currentSuggestion) return;
+    if (e.key === "Tab" || e.key === "Enter" || e.key === "Escape") return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (currentKeyHandler) {
+      document.removeEventListener("keydown", currentKeyHandler, true);
+      window.removeEventListener("keydown", currentKeyHandler, true);
+      document.removeEventListener("keyup", currentKeyHandler, true);
+      window.removeEventListener("keyup", currentKeyHandler, true);
+      currentKeyHandler = null;
+    }
+    currentSuggestion.destroy();
+    currentSuggestion = null;
+    if (instantTimer) {
+      clearTimeout(instantTimer);
+      instantTimer = null;
+    }
+  }, true);
+
   // Listen for Enter key to cancel instant translate
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
