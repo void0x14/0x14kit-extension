@@ -54,6 +54,7 @@ const DEFAULT_SETTINGS = {
   instantPosition: "auto",
   instantExcludedDomains: [],
   migratedAllSites: true,
+  allowGoogleFallback: false,
   // AI Provider settings — local on-device Nano is the default; no API keys
   activeProviderId: "builtin",
   providers: [
@@ -347,13 +348,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             };
 
             sendResponse({ ok: true, result: resultObj });
-          } else if (providerType === "gemini-nano" || providerType === "builtin") {
-            // Nano-only policy: only rescue when the on-device Translator API
-            // does not exist at all (old browser builds). Pair/model problems
-            // surface as errors instead of silently switching engines.
-            const errText = String(offscreenResult?.error || "");
-            if (/not supported/i.test(errText)) {
-              console.warn("TransKit background: Translator API absent, using google-translate fallback");
+          } else {
+            // Local-Nano-only policy: never silently switch engines. If the
+            // on-device Translator API is missing (e.g. Linux Chrome builds),
+            // surface the error; the user can enable the optional GT rescue
+            // (allowGoogleFallback) or pick another provider themselves.
+            const errText = String(offscreenResult?.error || "Unknown offscreen error");
+            if (/not supported/i.test(errText) && settings.allowGoogleFallback === true) {
+              console.warn("TransKit background: Translator API absent, using user-enabled google-translate fallback");
               const gtProvider = settings.providers?.find(p => p.type === "google-translate");
               const gtResult = await aiService.translate(textToTranslate, sourceLang, targetLang, gtProvider?.id);
               sendResponse({
@@ -367,10 +369,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 }
               });
             } else {
-              sendResponse({ ok: false, error: errText || "Unknown offscreen error" });
+              const hint = /not supported/i.test(errText)
+                ? errText + " (Bu cihazin Chrome'unda yerel Translator API yok.)"
+                : errText;
+              sendResponse({ ok: false, error: hint });
             }
-          } else {
-            sendResponse({ ok: false, error: offscreenResult?.error || "Unknown offscreen error" });
           }
         } else {
           // Convert back to HTML if formatting was converted
