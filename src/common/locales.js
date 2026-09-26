@@ -8,6 +8,7 @@ export const locales = {
     "popup.revertTimeout": "Revert Timeout (seconds)",
     "popup.useAutoDetect": "Auto-detect Source Language",
     "popup.showConfirmModal": "Show Confirm Modal",
+    "popup.allowGoogleFallback": "Google fallback if local Translator is missing",
     "popup.aliases": "Aliases",
     "popup.aliasKeyPlaceholder": "Key (e.g. e)",
     "popup.aliasValuePlaceholder": "Code (e.g. en)",

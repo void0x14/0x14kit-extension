@@ -8,6 +8,7 @@ const targetSelect = document.querySelector("#target");
 
 const autoDetect = document.querySelector("#auto-detect");
 const confirmModal = document.querySelector("#confirm-modal");
+const gtFallback = document.querySelector("#gt-fallback");
 const saveBtn = document.querySelector("#save");
 const aliasListEl = document.querySelector("#alias-list");
 const aliasKeyInput = document.querySelector("#alias-key");
@@ -844,6 +845,9 @@ async function loadSettings() {
   populateSelects();
   translateUI();
   
+  if (gtFallback) {
+    gtFallback.checked = settings.allowGoogleFallback === true;
+  }
   if (instantEnabledCheckbox) {
     instantEnabledCheckbox.checked = settings.instantTranslateEnabled !== false;
   }
@@ -944,6 +948,7 @@ async function saveSettings() {
     targetLanguageCode: targetSelect ? targetSelect.value : "en",
     useAutoDetect: autoDetect ? autoDetect.checked : false,
     showConfirmModal: confirmModal ? confirmModal.checked : true,
+    allowGoogleFallback: gtFallback ? gtFallback.checked : false,
     aliases: currentAliases || {},
     interfaceLanguage: document.querySelector("#lang-toggle .active")?.getAttribute("data-lang") || "en",
     instantTranslateEnabled: instantEnabledCheckbox?.checked !== false,
@@ -1037,6 +1042,7 @@ nativeSelect.addEventListener("change", saveSettings);
 targetSelect.addEventListener("change", saveSettings);
 
 autoDetect.addEventListener("change", saveSettings);
+if (gtFallback) gtFallback.addEventListener("change", saveSettings);
 confirmModal.addEventListener("change", saveSettings);
 
 const langToggle = document.querySelector("#lang-toggle");
