@@ -32,6 +32,34 @@ async function ensureOffscreen() {
   }
 }
 
+/**
+ * Detection-only language probe used to decide the translation direction
+ * BEFORE the single translation pass. google-translate probes the
+ * dict-chrome-ex endpoint via AIProviderService.detect; the built-in Nano
+ * provider probes the LanguageDetector in the offscreen document. Never
+ * throws — any failure returns { ok: false } so the caller keeps the
+ * requested direction instead of attempting a second pass.
+ */
+async function detectSourceLanguage(aiService, providerType, providerId, text) {
+  try {
+    if (providerType === "google-translate") {
+      return await aiService.detect(text, providerId);
+    }
+    if (providerType === "gemini-nano") {
+      await ensureOffscreen();
+      const res = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "offscreen-detect",
+        payload: { text }
+      });
+      if (res?.ok && res.detected) return { ok: true, detected: res.detected };
+    }
+  } catch (err) {
+    console.warn("TransKit background: direction detection failed:", err);
+  }
+  return { ok: false };
+}
+
 const DEFAULT_SETTINGS = {
   enabled: true,
   nativeLanguageCode: "vi",
@@ -272,62 +300,62 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           hasFormatting = true;
         }
         
-        const result = await aiService.translate(textToTranslate, sourceLang, targetLang, providerId);
-
-        // Direction sanity check: when the typed text is already in the target
-        // language, translating target->target is a no-op. Start detection
-        // from 'auto' so the provider reports the true source, and flip the
-        // direction towards the native language when needed. Generic language
-        // logic, no per-site behavior.
-        let finalResult = result;
-        let finalTargetLang = targetLang;
+        // --- Direction decision (detection BEFORE translation) ---
+        // Instant mode forces the native source; when the typed text is
+        // already in the target language a native->target pass would be a
+        // no-op. Instead of translating with the requested pair and then
+        // re-translating with source=auto just to read the direction (2-3
+        // full passes for long texts), run a cheap DETECTION-ONLY probe
+        // first and translate exactly ONCE with the decided pair.
         const wantsFlip = message.payload?.flipOnSameLanguage === true;
         const nativeCode = (message.payload?.nativeLanguageCode || "").toLowerCase();
         const nativeMain = nativeCode.split("-")[0];
         const targetCodeNorm = (targetLang || "").toLowerCase();
+        const targetMain = targetCodeNorm.split("-")[0];
         const sourceCodeNorm = (sourceLang || "").toLowerCase();
+        const payloadAutoDetect = message.payload?.useAutoDetect === true;
 
-        // Only re-request with auto when the caller forced the native source
-        // (instant mode) — explicit !!lang commands keep their semantics.
-        const shouldAutoDetectForFlip =
-          wantsFlip && nativeMain && sourceCodeNorm === nativeMain && nativeMain !== targetCodeNorm;
+        // Only providers with a dedicated detection probe can decide the
+        // direction upfront; anything else keeps the requested direction in
+        // a single pass.
+        const providerCanDetect =
+          providerType === "google-translate" || providerType === "gemini-nano";
 
-        let effectiveResult = result;
-        if (shouldAutoDetectForFlip && result && !result.useOffscreen) {
-          try {
-            effectiveResult = await aiService.translate(textToTranslate, "auto", targetLang, providerId);
-          } catch (autoErr) {
-            console.warn("TransKit background: auto-detect retry failed:", autoErr);
-            effectiveResult = result;
+        // The text could already be in the target language when the source
+        // is auto (useAutoDetect / source=auto) or when instant mode forced
+        // the native source. Explicit !!lang commands (any other explicit
+        // source) keep their semantics.
+        const shouldCheckDirection =
+          wantsFlip && providerCanDetect && nativeMain && nativeMain !== targetMain &&
+          (payloadAutoDetect || sourceCodeNorm === "auto" || sourceCodeNorm === nativeMain || sourceCodeNorm === targetMain);
+
+        let effectiveSource = sourceLang;
+        let effectiveTarget = targetLang;
+        let flipped = false;
+        if (shouldCheckDirection) {
+          const detection = await detectSourceLanguage(aiService, providerType, providerId, textToTranslate);
+          const detectedMain = detection?.ok ? String(detection.detected || "").toLowerCase().split("-")[0] : "";
+          if (detectedMain && detectedMain === targetMain) {
+            // Text is already in the target language -> flip towards native.
+            effectiveSource = targetLang;
+            effectiveTarget = nativeCode;
+            flipped = true;
           }
+          // Detection unavailable/failed -> keep the requested direction
+          // (one pass, no second attempt).
         }
 
-        const detected = (effectiveResult?.detectedSource || "").toLowerCase().split("-")[0];
-        const needsFlip = shouldAutoDetectForFlip && detected && detected !== nativeMain;
-
-        if (needsFlip && detected === targetCodeNorm) {
-          // Text is already in the target language -> translate to native
-          try {
-            const flipped = await aiService.translate(textToTranslate, detected, nativeCode, providerId);
-            if (flipped?.useOffscreen || flipped?.translation) {
-              finalResult = flipped;
-              finalTargetLang = nativeCode;
-            }
-          } catch (flipErr) {
-            console.warn("TransKit background: flip re-translate failed:", flipErr);
-          }
-        } else if (effectiveResult && effectiveResult !== result) {
-          finalResult = effectiveResult;
-        }
+        const result = await aiService.translate(textToTranslate, effectiveSource, effectiveTarget, providerId);
 
         // If result is the special signal for Window AI, use offscreen
-        if (finalResult?.useOffscreen) {
+        if (result?.useOffscreen) {
           await ensureOffscreen();
-          const offscreenPayload = { ...message.payload, text: textToTranslate, targetLanguage: finalTargetLang };
-          if (shouldAutoDetectForFlip) {
-            // Let the built-in detector decide the real source direction
-            offscreenPayload.sourceLanguage = "auto";
-            offscreenPayload.useAutoDetect = true;
+          const offscreenPayload = { ...message.payload, text: textToTranslate, targetLanguage: effectiveTarget };
+          if (flipped) {
+            // Direction already decided by the detection probe above — hand
+            // over the concrete pair so offscreen does not re-detect.
+            offscreenPayload.sourceLanguage = effectiveSource;
+            offscreenPayload.useAutoDetect = false;
           }
           const offscreenResult = await chrome.runtime.sendMessage({
             target: "offscreen",
@@ -361,15 +389,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (/not supported/i.test(errText) && settings.allowGoogleFallback === true) {
               console.warn("TransKit background: Translator API absent, using user-enabled google-translate fallback");
               const gtProvider = settings.providers?.find(p => p.type === "google-translate");
-              const gtResult = await aiService.translate(textToTranslate, sourceLang, targetLang, gtProvider?.id);
+              const gtResult = await aiService.translate(textToTranslate, effectiveSource, effectiveTarget, gtProvider?.id);
               sendResponse({
                 ok: true,
                 result: {
                   translation: gtResult?.translation,
                   providerName: "Google Translate (fallback)",
                   providerType: "google-translate",
-                  sourceLanguage: sourceLang,
-                  targetLanguage: gtResult?.detectedSource === targetCodeNorm ? nativeCode : targetLang
+                  sourceLanguage: effectiveSource,
+                  targetLanguage: effectiveTarget
                 }
               });
             } else {
@@ -381,7 +409,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         } else {
           // Convert back to HTML if formatting was converted
-          let translation = finalResult?.translation;
+          let translation = result?.translation;
           if (hasFormatting && translation) {
             translation = markdownToHtml(translation);
           }
@@ -391,10 +419,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ok: true,
             result: {
               translation: translation,
-              providerName: finalResult?.providerName,
-              providerType: finalResult?.providerType,
-              sourceLanguage: sourceLang,
-              targetLanguage: finalTargetLang
+              providerName: result?.providerName,
+              providerType: result?.providerType,
+              sourceLanguage: effectiveSource,
+              targetLanguage: effectiveTarget,
+              ...(result?.detectedSource ? { detectedSource: result.detectedSource } : {})
             }
           });
         }

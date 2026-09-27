@@ -151,14 +151,26 @@ function renderAliases() {
   Object.entries(currentAliases).forEach(([key, value]) => {
     const item = document.createElement("div");
     item.className = "bt-alias-item";
-    item.innerHTML = `
-      <span><b>${key}</b> → ${value}</span>
-      <button data-key="${key}" class="bt-remove-alias">×</button>
-    `;
+
+    // Alias key/value are user-typed: build via DOM, never interpolate.
+    const label = document.createElement("span");
+    const keyEl = document.createElement("b");
+    keyEl.textContent = key;
+    label.appendChild(keyEl);
+    label.appendChild(document.createTextNode(" → "));
+    label.appendChild(document.createTextNode(value));
+
+    const btn = document.createElement("button");
+    btn.className = "bt-remove-alias";
+    btn.textContent = "×";
+    btn.dataset.key = key;
+
+    item.appendChild(label);
+    item.appendChild(btn);
     aliasListEl.appendChild(item);
   });
 
-  document.querySelectorAll(".bt-remove-alias").forEach((btn) => {
+  aliasListEl.querySelectorAll(".bt-remove-alias").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       const key = e.target.dataset.key;
       delete currentAliases[key];
@@ -175,10 +187,19 @@ function renderDomains() {
   currentDomains.forEach((item, index) => {
     const div = document.createElement("div");
     div.className = "bt-domain-item";
-    div.innerHTML = `
-      <span class="bt-domain-name">${item.domain}</span>
-      <button class="bt-remove-alias" data-index="${index}">×</button>
-    `;
+
+    // Domain is user-typed: build via DOM, never interpolate.
+    const name = document.createElement("span");
+    name.className = "bt-domain-name";
+    name.textContent = item.domain;
+
+    const btn = document.createElement("button");
+    btn.className = "bt-remove-alias";
+    btn.textContent = "×";
+    btn.dataset.index = index;
+
+    div.appendChild(name);
+    div.appendChild(btn);
     domainListEl.appendChild(div);
   });
 
@@ -191,42 +212,58 @@ function renderDomains() {
   });
 }
 
+function createProviderActionButton(className, text, id) {
+  const btn = document.createElement("button");
+  btn.className = className;
+  btn.textContent = text;
+  btn.dataset.id = id;
+  return btn;
+}
+
 function renderProviderList() {
   providerListEl.innerHTML = "";
-  
+
   // Define default provider IDs that cannot be edited or deleted
   const DEFAULT_PROVIDER_IDS = ["google-translate", "builtin"];
-  
+
   providers.forEach(p => {
     const isActive = p.id === activeProviderId;
     const isDefaultProvider = DEFAULT_PROVIDER_IDS.includes(p.id);
-    
+
     const el = document.createElement("div");
     el.className = `bt-provider-item ${isActive ? 'active' : ''}`;
-    
-    // Actions
-    let actionsHtml = '';
+
+    // Provider name is user-typed: build via DOM, never interpolate.
+    const info = document.createElement("div");
+    info.className = "bt-provider-info";
+    const nameDiv = document.createElement("div");
+    nameDiv.className = "bt-provider-name";
+    nameDiv.textContent = p.name;
+    const typeDiv = document.createElement("div");
+    typeDiv.className = "bt-provider-type";
+    typeDiv.textContent = p.type;
+    info.appendChild(nameDiv);
+    info.appendChild(typeDiv);
+
+    const actions = document.createElement("div");
+    actions.className = "bt-provider-actions";
     if (isActive) {
-      actionsHtml += `<span class="bt-badge-active">${i18n.t("popup.active")}</span>`;
+      const badge = document.createElement("span");
+      badge.className = "bt-badge-active";
+      badge.textContent = i18n.t("popup.active");
+      actions.appendChild(badge);
     } else {
-      actionsHtml += `<button class="bt-btn-text btn-set-active" data-id="${p.id}">${i18n.t("popup.use")}</button>`;
-    }
-    
-    // Only allow edit/delete for non-default providers
-    if (!isDefaultProvider) {
-      actionsHtml += `<button class="bt-btn-text btn-edit" data-id="${p.id}">${i18n.t("popup.edit")}</button>`;
-      actionsHtml += `<button class="bt-btn-text btn-delete" data-id="${p.id}">${i18n.t("popup.delete")}</button>`;
+      actions.appendChild(createProviderActionButton("bt-btn-text btn-set-active", i18n.t("popup.use"), p.id));
     }
 
-    el.innerHTML = `
-      <div class="bt-provider-info">
-        <div class="bt-provider-name">${p.name}</div>
-        <div class="bt-provider-type">${p.type}</div>
-      </div>
-      <div class="bt-provider-actions">
-        ${actionsHtml}
-      </div>
-    `;
+    // Only allow edit/delete for non-default providers
+    if (!isDefaultProvider) {
+      actions.appendChild(createProviderActionButton("bt-btn-text btn-edit", i18n.t("popup.edit"), p.id));
+      actions.appendChild(createProviderActionButton("bt-btn-text btn-delete", i18n.t("popup.delete"), p.id));
+    }
+
+    el.appendChild(info);
+    el.appendChild(actions);
     providerListEl.appendChild(el);
   });
 
@@ -293,9 +330,35 @@ function getProviderInfo(type) {
   }
 }
 
+function appendProviderField(labelText, { inputType = "text", id, value = "", placeholder = "", hint = "" }) {
+  const field = document.createElement("div");
+  field.className = "bt-field";
+
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  field.appendChild(label);
+
+  const input = document.createElement("input");
+  input.type = inputType;
+  input.id = id;
+  input.className = inputType === "password" ? "bt-input api-key-input" : "bt-input";
+  input.value = value;
+  if (placeholder) input.placeholder = placeholder;
+  field.appendChild(input);
+
+  if (hint) {
+    const small = document.createElement("small");
+    small.style.color = "#666";
+    small.textContent = hint;
+    field.appendChild(small);
+  }
+
+  formDynamicFields.appendChild(field);
+}
+
 function renderFormFields(type, config = {}) {
   formDynamicFields.innerHTML = "";
-  
+
   // Info Link
   const info = getProviderInfo(type);
   if (info) {
@@ -307,100 +370,39 @@ function renderFormFields(type, config = {}) {
     formDynamicFields.appendChild(infoDiv);
   }
 
+  // Config values (API keys, models, base URLs) are user-typed: assign them
+  // via element properties, never interpolate into HTML attributes.
   if (type === "gemini") {
     const model = config.model || "gemini-flash-latest";
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>API Key</label>
-        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
-      </div>
-      <div class="bt-field">
-        <label>Model</label>
-        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="gemini-flash-latest" />
-      </div>
-    `);
+    appendProviderField("API Key", { inputType: "password", id: "field-apiKey", value: config.apiKey || "" });
+    appendProviderField("Model", { id: "field-model", value: model, placeholder: "gemini-flash-latest" });
   } else if (type === "openai") {
     const model = config.model || "gpt-3.5-turbo";
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>API Key</label>
-        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
-      </div>
-      <div class="bt-field">
-        <label>Model</label>
-        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="gpt-3.5-turbo" />
-      </div>
-      <div class="bt-field">
-        <label>Base URL (Optional)</label>
-        <input type="text" id="field-baseUrl" class="bt-input" value="${config.baseUrl || ''}" placeholder="https://api.openai.com/v1" />
-      </div>
-    `);
+    appendProviderField("API Key", { inputType: "password", id: "field-apiKey", value: config.apiKey || "" });
+    appendProviderField("Model", { id: "field-model", value: model, placeholder: "gpt-3.5-turbo" });
+    appendProviderField("Base URL (Optional)", { id: "field-baseUrl", value: config.baseUrl || "", placeholder: "https://api.openai.com/v1" });
   } else if (type === "openrouter") {
     const model = config.model || "google/gemini-2.0-flash-exp:free";
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>API Key</label>
-        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
-      </div>
-      <div class="bt-field">
-        <label>Model</label>
-        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="google/gemini-2.0-flash-exp:free" />
-      </div>
-    `);
+    appendProviderField("API Key", { inputType: "password", id: "field-apiKey", value: config.apiKey || "" });
+    appendProviderField("Model", { id: "field-model", value: model, placeholder: "google/gemini-2.0-flash-exp:free" });
   } else if (type === "deepl") {
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>API Key</label>
-        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
-      </div>
-    `);
+    appendProviderField("API Key", { inputType: "password", id: "field-apiKey", value: config.apiKey || "" });
   } else if (type === "groq") {
     const model = config.model || "llama-3.3-70b-versatile";
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>API Key</label>
-        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" />
-      </div>
-      <div class="bt-field">
-        <label>Model</label>
-        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="llama-3.3-70b-versatile" />
-        <small style="color: #666;">Lightning-fast inference (llama-3.3-70b-versatile, mixtral-8x7b, etc.)</small>
-      </div>
-    `);
+    appendProviderField("API Key", { inputType: "password", id: "field-apiKey", value: config.apiKey || "" });
+    appendProviderField("Model", { id: "field-model", value: model, placeholder: "llama-3.3-70b-versatile", hint: "Lightning-fast inference (llama-3.3-70b-versatile, mixtral-8x7b, etc.)" });
   } else if (type === "ollama") {
     const model = config.model || "llama2";
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>Base URL</label>
-        <input type="text" id="field-baseUrl" class="bt-input" value="${config.baseUrl || 'http://localhost:11434/v1'}" placeholder="http://localhost:11434/v1" />
-        <small style="color: #666;">Default Ollama endpoint</small>
-      </div>
-      <div class="bt-field">
-        <label>Model</label>
-        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="llama2" />
-        <small style="color: #666;">e.g., llama2, mistral, codellama</small>
-      </div>
-    `);
+    appendProviderField("Base URL", { id: "field-baseUrl", value: config.baseUrl || "http://localhost:11434/v1", placeholder: "http://localhost:11434/v1", hint: "Default Ollama endpoint" });
+    appendProviderField("Model", { id: "field-model", value: model, placeholder: "llama2", hint: "e.g., llama2, mistral, codellama" });
   } else if (type === "custom") {
     const baseUrl = config.baseUrl || "";
     const model = config.model || "gpt-3.5-turbo";
-    formDynamicFields.insertAdjacentHTML('beforeend', `
-      <div class="bt-field">
-        <label>Base URL</label>
-        <input type="text" id="field-baseUrl" class="bt-input" value="${baseUrl}" placeholder="https://api.example.com/v1" />
-        <small style="color: #666;">OpenAI-compatible API endpoint</small>
-      </div>
-      <div class="bt-field">
-        <label>Model</label>
-        <input type="text" id="field-model" class="bt-input" value="${model}" placeholder="gpt-3.5-turbo" />
-      </div>
-      <div class="bt-field">
-        <label>API Key (Optional)</label>
-        <input type="password" id="field-apiKey" class="bt-input api-key-input" value="${config.apiKey || ''}" placeholder="Leave empty if not needed" />
-      </div>
-    `);
+    appendProviderField("Base URL", { id: "field-baseUrl", value: baseUrl, placeholder: "https://api.example.com/v1", hint: "OpenAI-compatible API endpoint" });
+    appendProviderField("Model", { id: "field-model", value: model, placeholder: "gpt-3.5-turbo" });
+    appendProviderField("API Key (Optional)", { inputType: "password", id: "field-apiKey", value: config.apiKey || "", placeholder: "Leave empty if not needed" });
   }
-  
+
   // Security Note
   formDynamicFields.insertAdjacentHTML('beforeend', `
     <div class="bt-security-note">
@@ -444,7 +446,6 @@ function closeProviderForm(isCancel = false) {
 function autoSaveProviderForm() {
   if (!isSettingsLoaded) return;
   if (!providerForm || providerForm.hidden) return;
-  if (!providerForm || providerForm.hidden) return;
 
   const type = formType ? formType.value : "gemini";
   const name = formName ? (formName.value.trim() || type) : type;
@@ -467,8 +468,10 @@ function autoSaveProviderForm() {
       saveSettings();
     }
   } else {
-    if (!editingProviderId) return; // Only auto-save when actively editing an existing form
-    // If adding a new provider and user typed an API key, baseUrl, or custom model/name
+    // NEW provider draft: auto-create as soon as the user typed anything
+    // meaningful, so a half-typed form survives navigation. Cancel still
+    // removes the draft (closeProviderForm filters by editingProviderId
+    // while isNewProvider is true).
     if (config.apiKey || config.baseUrl || (config.model && config.model.trim()) || (name && name !== type)) {
       const newId = crypto.randomUUID();
       editingProviderId = newId;
@@ -565,32 +568,40 @@ function renderTTSProviderList() {
   
   allProviders.forEach(p => {
     const isActive = p.id === activeTTSProviderId;
-    
+
     const el = document.createElement("div");
     el.className = `bt-provider-item ${isActive ? 'active' : ''}`;
-    
-    // Actions
-    let actionsHtml = '';
+
+    // Provider name is user-typed: build via DOM, never interpolate.
+    const info = document.createElement("div");
+    info.className = "bt-provider-info";
+    const nameDiv = document.createElement("div");
+    nameDiv.className = "bt-provider-name";
+    nameDiv.textContent = p.name;
+    const typeDiv = document.createElement("div");
+    typeDiv.className = "bt-provider-type";
+    typeDiv.textContent = p.type === 'google' ? 'Standard' : 'Custom URL';
+    info.appendChild(nameDiv);
+    info.appendChild(typeDiv);
+
+    const actions = document.createElement("div");
+    actions.className = "bt-provider-actions";
     if (isActive) {
-      actionsHtml += `<span class="bt-badge-active">${i18n.t("popup.active")}</span>`;
+      const badge = document.createElement("span");
+      badge.className = "bt-badge-active";
+      badge.textContent = i18n.t("popup.active");
+      actions.appendChild(badge);
     } else {
-      actionsHtml += `<button class="bt-btn-text btn-set-active-tts" data-id="${p.id}">${i18n.t("popup.use")}</button>`;
-    }
-    
-    if (!p.readonly) {
-      actionsHtml += `<button class="bt-btn-text btn-edit-tts" data-id="${p.id}">${i18n.t("popup.edit")}</button>`;
-      actionsHtml += `<button class="bt-btn-text btn-delete-tts" data-id="${p.id}">${i18n.t("popup.delete")}</button>`;
+      actions.appendChild(createProviderActionButton("bt-btn-text btn-set-active-tts", i18n.t("popup.use"), p.id));
     }
 
-    el.innerHTML = `
-      <div class="bt-provider-info">
-        <div class="bt-provider-name">${p.name}</div>
-        <div class="bt-provider-type">${p.type === 'google' ? 'Standard' : 'Custom URL'}</div>
-      </div>
-      <div class="bt-provider-actions">
-        ${actionsHtml}
-      </div>
-    `;
+    if (!p.readonly) {
+      actions.appendChild(createProviderActionButton("bt-btn-text btn-edit-tts", i18n.t("popup.edit"), p.id));
+      actions.appendChild(createProviderActionButton("bt-btn-text btn-delete-tts", i18n.t("popup.delete"), p.id));
+    }
+
+    el.appendChild(info);
+    el.appendChild(actions);
     ttsProviderListEl.appendChild(el);
   });
 
@@ -713,8 +724,16 @@ if (btnAddTTSProvider) btnAddTTSProvider.addEventListener("click", () => openTTS
 if (btnTTSFormCancel) btnTTSFormCancel.addEventListener("click", () => closeTTSProviderForm(true));
 if (btnTTSFormSave) btnTTSFormSave.addEventListener("click", saveTTSProviderFromForm);
 
+let ttsFormAutoSaveTimer = null;
+function debouncedAutoSaveTTSForm() {
+  if (ttsFormAutoSaveTimer) clearTimeout(ttsFormAutoSaveTimer);
+  ttsFormAutoSaveTimer = setTimeout(() => {
+    autoSaveTTSForm();
+  }, 250);
+}
+
 if (ttsProviderForm) {
-  ttsProviderForm.addEventListener("input", autoSaveTTSForm);
+  ttsProviderForm.addEventListener("input", debouncedAutoSaveTTSForm);
   ttsProviderForm.addEventListener("change", autoSaveTTSForm);
 }
 
@@ -795,7 +814,7 @@ async function loadSettings() {
         { id: "google-translate", type: "google-translate", name: "Google Translate", config: {} },
         { id: "builtin", type: "gemini-nano", name: "Chrome Built-in AI", config: {} }
       ],
-      activeProviderId: "google-translate",
+      activeProviderId: "builtin",
       ttsProviders: [],
       activeTTSProviderId: "google-tts",
       customPrompt: "",
@@ -936,6 +955,18 @@ async function loadSettings() {
   isSettingsLoaded = true;
 }
 
+let saveFeedbackTimer = null;
+function showSaveFeedback(ok) {
+  if (!saveBtn) return;
+  if (saveFeedbackTimer) clearTimeout(saveFeedbackTimer);
+  saveBtn.textContent = ok ? i18n.t("popup.saved") : i18n.t("popup.saveFailed");
+  saveBtn.style.color = ok ? "" : "var(--bt-color-danger, #d93025)";
+  saveFeedbackTimer = setTimeout(() => {
+    saveBtn.textContent = i18n.t("popup.savePreferences");
+    saveBtn.style.color = "";
+  }, 1800);
+}
+
 async function saveSettings() {
   if (!isSettingsLoaded) {
     console.warn("TransKit popup: saveSettings skipped because settings are not loaded yet");
@@ -991,34 +1022,54 @@ async function saveSettings() {
   };
 
   // 1. Direct write to chrome.storage.local for immediate persistence:
+  let persisted = true;
   try {
     await chrome.storage.local.set({ translatorSettings: settings });
   } catch (err) {
+    persisted = false;
     console.error("TransKit popup: storage.local.set error:", err);
   }
 
-  // 2. Also notify background service worker:
+  // 2. Also notify background service worker. The background writes the
+  //    settings too and reports ok:false when that write fails, so an
+  //    explicit rejection is a real persistence failure.
+  let backgroundRejected = false;
   try {
     const res = await chrome.runtime.sendMessage({
       type: "set-settings",
       settings
     });
-
-    if (res?.ok && saveBtn) {
-      saveBtn.textContent = i18n.t("popup.saved");
-      setTimeout(() => {
-        saveBtn.textContent = i18n.t("popup.savePreferences");
-      }, 1800);
-    }
+    backgroundRejected = res?.ok === false;
   } catch (err) {
+    // Background unreachable (e.g. context invalidated): chrome.storage.local
+    // above is the source of truth, so treat persistence as whatever the
+    // storage write did.
     console.warn("TransKit popup: sendMessage set-settings warning:", err);
-    if (saveBtn) {
-      saveBtn.textContent = i18n.t("popup.saved");
-      setTimeout(() => {
-        saveBtn.textContent = i18n.t("popup.savePreferences");
-      }, 1800);
-    }
   }
+
+  // 3. Truthful feedback: only report success when persistence actually held.
+  const ok = persisted && !backgroundRejected;
+  showSaveFeedback(ok);
+  return ok;
+}
+
+// Debounced settings persistence for keystroke-driven inputs: keep the
+// in-memory state instant, flush chrome.storage after a short pause and on
+// pagehide so the popup never churns storage on every keystroke.
+let pendingSaveTimer = null;
+function debouncedSaveSettings(delay = 300) {
+  if (pendingSaveTimer) clearTimeout(pendingSaveTimer);
+  pendingSaveTimer = setTimeout(() => {
+    pendingSaveTimer = null;
+    saveSettings();
+  }, delay);
+}
+
+function flushPendingSaveSettings() {
+  if (!pendingSaveTimer) return;
+  clearTimeout(pendingSaveTimer);
+  pendingSaveTimer = null;
+  saveSettings();
 }
 
 addAliasBtn.addEventListener("click", () => {
@@ -1159,7 +1210,9 @@ function updateCharCounter() {
 if (userCustomPrompt) {
   userCustomPrompt.addEventListener("input", () => {
     updateCharCounter();
-    saveSettings();
+    // Debounced write: the textarea itself is the instant in-memory state,
+    // chrome.storage is flushed after the user pauses typing.
+    debouncedSaveSettings(300);
   });
 }
 
@@ -1234,18 +1287,37 @@ function renderHoverDomainList(domains) {
   (domains || []).forEach((d, index) => {
     const item = document.createElement('div');
     item.className = 'bt-domain-item';
-    item.innerHTML = `
-      <div class="bt-domain-info">
-        <span class="bt-domain-name">${d.domain}</span>
-      </div>
-      <div class="bt-domain-actions">
-        <label class="bt-domain-toggle">
-          <input type="checkbox" ${d.enabled ? 'checked' : ''} data-index="${index}" class="hover-domain-toggle">
-          <span>Active</span>
-        </label>
-        <button class="bt-button-icon remove-hover-domain" data-index="${index}">×</button>
-      </div>
-    `;
+
+    // Domain is user-typed: build via DOM, never interpolate.
+    const info = document.createElement('div');
+    info.className = 'bt-domain-info';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'bt-domain-name';
+    nameSpan.textContent = d.domain;
+    info.appendChild(nameSpan);
+
+    const actions = document.createElement('div');
+    actions.className = 'bt-domain-actions';
+    const toggleLabel = document.createElement('label');
+    toggleLabel.className = 'bt-domain-toggle';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.checked = !!d.enabled;
+    toggle.dataset.index = index;
+    toggle.className = 'hover-domain-toggle';
+    const activeLabel = document.createElement('span');
+    activeLabel.textContent = 'Active';
+    toggleLabel.appendChild(toggle);
+    toggleLabel.appendChild(activeLabel);
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'bt-button-icon remove-hover-domain';
+    removeBtn.textContent = '×';
+    removeBtn.dataset.index = index;
+    actions.appendChild(toggleLabel);
+    actions.appendChild(removeBtn);
+
+    item.appendChild(info);
+    item.appendChild(actions);
     hoverDomainList.appendChild(item);
   });
   
@@ -1283,11 +1355,13 @@ document.addEventListener("mouseleave", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  flushPendingSaveSettings();
   autoSaveProviderForm();
   autoSaveTTSForm();
 });
 
 window.addEventListener("beforeunload", () => {
+  flushPendingSaveSettings();
   autoSaveProviderForm();
   autoSaveTTSForm();
 });

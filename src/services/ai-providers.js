@@ -192,6 +192,14 @@ const GT_ENDPOINTS = [
 
 const GT_TIMEOUT_MS = 12000;
 const GT_MAX_CHUNK = 2800;
+// Bounded parallelism for multi-chunk texts. Sequential chunk translation was
+// the dominant latency cost for long texts (4 chunks = 4x); higher values
+// than 2 risk Google Translate 429 rate limiting.
+const GT_CONCURRENCY = 2;
+// Detection-only probe: short timeout, small text sample (detection does not
+// need the full text, just a representative prefix).
+const GT_DETECT_TIMEOUT_MS = 5000;
+const GT_DETECT_SAMPLE = 1000;
 
 function gtSplitChunks(text) {
   if (text.length <= GT_MAX_CHUNK) return [text];
@@ -237,6 +245,26 @@ function gtSplitChunks(text) {
   return chunks.length ? chunks : [text];
 }
 
+/**
+ * Map `fn` over `items` with at most `limit` calls in flight. The returned
+ * array preserves the input order regardless of completion order.
+ */
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  const workerCount = Math.max(0, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
 class GoogleTranslateProvider extends TranslationProvider {
   async translate(text, sourceLang, targetLang) {
     const sl = sourceLang === "auto" ? "auto" : sourceLang.toLowerCase();
@@ -246,12 +274,19 @@ class GoogleTranslateProvider extends TranslationProvider {
 
     const chunks = gtSplitChunks(text);
     let detectedSource = sl !== "auto" ? sl : null;
-    const translations = [];
 
-    for (const chunk of chunks) {
-      const result = await this.translateChunk(chunk, sl, tl);
-      translations.push(result.translation);
-      if (result.detectedSource) detectedSource = result.detectedSource;
+    // Translate chunks with bounded concurrency (GT_CONCURRENCY). Chunks run
+    // through the same per-chunk endpoint chain / retry logic as before;
+    // mapWithConcurrency keeps results in chunk order. Per-chunk retries and
+    // endpoint fallbacks are unchanged.
+    const chunkResults = await mapWithConcurrency(chunks, GT_CONCURRENCY, (chunk) =>
+      this.translateChunk(chunk, sl, tl)
+    );
+
+    const translations = [];
+    for (const chunkResult of chunkResults) {
+      translations.push(chunkResult.translation);
+      if (chunkResult.detectedSource) detectedSource = chunkResult.detectedSource;
     }
 
     // Preserve paragraph breaks when the source had them; otherwise the text
@@ -279,6 +314,49 @@ class GoogleTranslateProvider extends TranslationProvider {
     }
 
     throw lastError || new Error("Google Translate is unavailable");
+  }
+
+  /**
+   * Detection-only probe: the dict-chrome-ex /t endpoint with sl=auto returns
+   * the detected source language alongside the translation (same response
+   * shape parsed in callEndpoint's dict branch). Only a short text sample is
+   * sent. Never throws — callers fall back to the requested direction on
+   * { ok: false }.
+   */
+  async detect(text) {
+    try {
+      const source = typeof text === "string" ? text : "";
+      const sample = source.length > GT_DETECT_SAMPLE ? source.slice(0, GT_DETECT_SAMPLE) : source;
+      if (!sample.trim()) return { ok: false };
+
+      const params = new URLSearchParams();
+      params.set("client", "dict-chrome-ex");
+      params.set("sl", "auto");
+      params.set("tl", "en");
+      params.set("q", sample);
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), GT_DETECT_TIMEOUT_MS);
+      let response;
+      try {
+        response = await fetch(`https://clients5.google.com/translate_a/t?${params.toString()}`, {
+          method: "GET",
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      if (!response.ok) return { ok: false };
+
+      // dict style with sl=auto: [["translation","detected_src"],...]
+      const data = await response.json();
+      const entry = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : null;
+      const detected = entry && typeof entry[1] === "string" ? entry[1] : null;
+      return detected ? { ok: true, detected } : { ok: false };
+    } catch {
+      return { ok: false };
+    }
   }
 
   async callEndpoint(endpoint, sl, tl, text) {
@@ -592,6 +670,21 @@ export class AIProviderService {
       default:
         return new WindowAIProvider({});
     }
+  }
+
+  /**
+   * Detection-only probe for providers that support it (currently
+   * google-translate, via its dict-chrome-ex endpoint). Returns
+   * { ok, detected? } and never throws.
+   */
+  async detect(text, providerId) {
+    try {
+      const provider = this.getProvider(providerId);
+      if (provider && typeof provider.detect === "function") {
+        return await provider.detect(text);
+      }
+    } catch {}
+    return { ok: false };
   }
 
   async translate(text, sourceLang, targetLang, providerId) {

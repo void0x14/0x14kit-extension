@@ -205,6 +205,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  // Detection-only probe so the background can decide the translation
+  // direction BEFORE issuing its single translation pass.
+  if (message?.type === "offscreen-detect") {
+    const text = String(message.payload?.text || "");
+    if (!text.trim()) {
+      sendResponse({ ok: false });
+      return false;
+    }
+    detectLanguage(text)
+      .then((detected) =>
+        sendResponse(detected ? { ok: true, detected } : { ok: false })
+      )
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
   if (message?.type === "offscreen-translate") {
     const { text, nativeLanguageCode, targetLanguage, useAutoDetect, sourceLanguage } =
       message.payload || {};

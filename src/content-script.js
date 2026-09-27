@@ -16,7 +16,6 @@ function btSafeRoot() {
 }
 
 let isTranslating = false;
-let translatingTimeout = null;
 let suggestionAutoHideTimer = null;
 let lastAppliedText = "";
 let lastAppliedAt = 0;
@@ -27,6 +26,10 @@ let lastAppliedAt = 0;
 let instantEpoch = 0;
 const applyUndoStack = [];
 let debounceTimer = null;
+// Suggestion reposition is rAF-throttled (see registerInstantMode); the flag
+// and handle live at module scope so cleanupExtensionElements can reset them.
+let suggestionRepositionPending = false;
+let suggestionRepositionRafId = null;
 
 // Helper function to check if extension context is valid
 function isExtensionContextValid() {
@@ -580,12 +583,19 @@ function showToast(message) {
   // Set class based on type
   host.className = `bt-toast-notify bt-toast-notify-${toastType} bt-vars-container`;
 
-  host.innerHTML = `
-    <div class="bt-toast-notify-content">
-      <span class="bt-toast-notify-icon">${icon}</span>
-      <span class="bt-toast-notify-text">${message}</span>
-    </div>
-  `;
+  // Build with DOM APIs + textContent: provider error strings must render as
+  // text, never as HTML (they can contain markup/quotes).
+  const content = document.createElement("div");
+  content.className = "bt-toast-notify-content";
+  const iconSpan = document.createElement("span");
+  iconSpan.className = "bt-toast-notify-icon";
+  iconSpan.textContent = icon;
+  const textSpan = document.createElement("span");
+  textSpan.className = "bt-toast-notify-text";
+  textSpan.textContent = message;
+  content.appendChild(iconSpan);
+  content.appendChild(textSpan);
+  host.appendChild(content);
   document.documentElement.appendChild(host);
 
   // Fade out animation - close faster
@@ -630,11 +640,11 @@ function resolveTargetLanguage(raw, settings) {
 
 async function handleAutoTranslation(element, parsed) {
   if (!isExtensionContextValid()) return;
+  // Gate is reset on COMPLETION in the finally below (success, failure or
+  // exception all land there). No fixed 5-second timer: it could free the
+  // gate while a slow translation was still legitimately running, and it
+  // could also leave the gate stuck if it were cleared elsewhere.
   isTranslating = true;
-  if (translatingTimeout) clearTimeout(translatingTimeout);
-  translatingTimeout = setTimeout(() => {
-    isTranslating = false;
-  }, 5000);
   let suggestion = null;
 
   try {
@@ -771,10 +781,6 @@ async function handleAutoTranslation(element, parsed) {
     showToast(err.message || "An error occurred");
     console.error(err);
   } finally {
-    if (translatingTimeout) {
-      clearTimeout(translatingTimeout);
-      translatingTimeout = null;
-    }
     isTranslating = false;
   }
 }
@@ -810,8 +816,15 @@ function segmentQuotedText(text) {
   let m;
 
   // BBCode quotes: [quote], [quote=author], [quote=author date]...[/quote]
-  const bb = /\[quote[^\]]*\][\s\S]*?(?:\[\/quote\]|$)/gi;
-  while ((m = bb.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+  // Only run this scan when a closing tag actually exists: with the old
+  // swallow-to-end pattern, an unclosed literal "[quote" (a forum user
+  // writing ABOUT BBCode) classified the rest of the message as quoted
+  // material, so the instant trigger silently never fired. An unclosed tag
+  // is literal text — the user's own words.
+  if (/\[\/quote/i.test(text)) {
+    const bb = /\[quote[^\]]*\][\s\S]*?\[\/quote\]/gi;
+    while ((m = bb.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+  }
 
   // HTML blockquotes (rich editors that keep serialized HTML)
   const bq = /<blockquote[\s\S]*?<\/blockquote>|<blockquote[^>]*>[\s\S]*$/gi;
@@ -872,6 +885,7 @@ function shouldTriggerInstant(text) {
   if (!text || text.trim().length < 5) return false; // Too short
   if (/^https?:\/\//.test(text)) return false; // URL
   if (/^[!@#$%^&*()_+=\[\]{};':"\\|,.<>\/?`~-]+$/.test(text)) return false; // Only special chars
+  if (!/[\p{L}]/u.test(text)) return false; // No letters at all (emoji/punctuation-only)
   return true;
 }
 
@@ -1135,16 +1149,15 @@ function applyFieldStrategy(element, strategy, text, isBox) {
   }
 }
 
-function buildInlineSuggestion(element, translatedText, providerInfo, position = 'auto', settings = {}) {
-  const container = document.createElement('div');
-  container.className = 'bt-inline-suggestion bt-vars-container';
-  container.style.userSelect = 'none';
-  container.style.webkitUserSelect = 'none';
-
+// Positions (or repositions) a suggestion popup anchored to a field. Extracted
+// verbatim from buildInlineSuggestion (smart width, auto top/bottom choice,
+// viewport clamping) so the SAME logic can run again on every scroll/resize
+// frame while the popup is visible: chat apps scroll inner message containers
+// (window-level scroll never fires there), so a popup positioned once goes
+// stale — it must follow its field instead of being destroyed.
+function positionSuggestionNear(container, element, position = 'auto') {
   // Position relative to input
   const rect = element.getBoundingClientRect();
-  container.style.position = 'fixed';
-  container.style.zIndex = '9999999999';
 
   // Smart width calculation to prevent UI breaking on small inputs
   const minPopupWidth = 320;
@@ -1200,6 +1213,14 @@ function buildInlineSuggestion(element, translatedText, providerInfo, position =
     }
   }
 
+  // Clear any vertical anchor left by a previous call: a reposition that
+  // flips sides must not leave the opposite style/class behind, or the popup
+  // would carry both `top` and `bottom` at once.
+  container.style.top = '';
+  container.style.bottom = '';
+  container.classList.remove('bt-popup-top');
+  container.classList.remove('bt-popup-bottom');
+
   // Set vertical position based on final decision
   if (finalPosition === 'top') {
     container.style.bottom = `${viewport.height - rect.top + 8}px`;
@@ -1208,13 +1229,13 @@ function buildInlineSuggestion(element, translatedText, providerInfo, position =
     container.style.top = `${rect.bottom + 8}px`;
     container.classList.add('bt-popup-bottom');
   }
-  
-  // Add to DOM first to get dimensions
-  btSafeRoot().appendChild(container);
-  
+
+  // Add to DOM first (when not already mounted) to get dimensions
+  if (!container.isConnected) btSafeRoot().appendChild(container);
+
   // Get container dimensions and adjust position if needed
   const containerRect = container.getBoundingClientRect();
-  
+
   // Ensure container stays within viewport bounds
   if (finalPosition === 'bottom' && containerRect.bottom > viewport.height - 10) {
     // If bottom position causes overflow, try top position
@@ -1239,10 +1260,24 @@ function buildInlineSuggestion(element, translatedText, providerInfo, position =
       container.style.bottom = `${Math.max(10, viewport.height - containerRect.height - 10)}px`;
     }
   }
-  
-  // Remove from DOM temporarily to continue setup
-  container.remove();
-  
+}
+
+function buildInlineSuggestion(element, translatedText, providerInfo, position = 'auto', settings = {}) {
+  const container = document.createElement('div');
+  container.className = 'bt-inline-suggestion bt-vars-container';
+  container.style.userSelect = 'none';
+  container.style.webkitUserSelect = 'none';
+
+  container.style.position = 'fixed';
+  container.style.zIndex = '9999999999';
+
+  // Bounded popup height: a long translation must never cover the viewport.
+  // The suggestion text scrolls INSIDE the popup (see .bt-suggestion-text
+  // styles below) instead of growing the popup past this cap. Inline styles —
+  // the popup renders outside the reach of site stylesheets, and the
+  // positioning styles are already inline for the same reason.
+  container.style.maxHeight = '45vh';
+
   container.innerHTML = `
     <div class="bt-suggestion-content">
       <span class="bt-suggestion-icon">🔄</span>
@@ -1256,9 +1291,15 @@ function buildInlineSuggestion(element, translatedText, providerInfo, position =
   // Provider/model output is untrusted — never interpolate it as HTML.
   const suggestionTextEl = container.querySelector('.bt-suggestion-text');
   if (suggestionTextEl) {
+    // Long translations scroll here instead of pushing the popup over the
+    // viewport (container is capped at 45vh above).
+    suggestionTextEl.style.overflowY = 'auto';
+    suggestionTextEl.style.maxHeight = '38vh';
+    suggestionTextEl.style.whiteSpace = 'pre-wrap';
+    suggestionTextEl.style.wordBreak = 'break-word';
     suggestionTextEl.textContent = translatedText == null ? "" : String(translatedText);
   }
-  
+
   // Prevent clicking on the suggestion from blurring the input
   // EXCEPT for select elements (allow clicking model selector)
   const preventBlur = (e) => {
@@ -1271,11 +1312,12 @@ function buildInlineSuggestion(element, translatedText, providerInfo, position =
   };
   container.addEventListener('mousedown', preventBlur);
   container.addEventListener('pointerdown', preventBlur);
-  
+
   const providerContainer = container.querySelector('.bt-suggestion-provider-container');
   const providerSelect = populateProviderSelectorForSuggestion(providerContainer, settings);
 
-  btSafeRoot().appendChild(container);
+  // Position relative to input (same logic reused for live repositioning)
+  positionSuggestionNear(container, element, position);
 
   return {
     element: container,
@@ -1575,11 +1617,10 @@ async function handleInstantTranslate(element) {
   // than the 500ms justAppliedTranslation window).
   if (text === lastAppliedText && Date.now() - lastAppliedAt < 2500) return;
 
-  // Quote-aware: only the user's own words count for the trigger
-  const preSegments = segmentQuotedText(text);
-  const preOwn = ownSegments(preSegments);
-  if (preOwn.length === 0) return; // field contains only quoted material
-  if (!preOwn.some((s) => shouldTriggerInstant(s.text))) return;
+  // No pre-trigger segmentation here: this runs on EVERY keystroke and full
+  // field segmentation is expensive. The timer closure below re-validates
+  // the text (stripInvisibleChars + segmentQuotedText) right before
+  // translating, so quoted-only fields are still skipped there.
 
   let settings;
   try {
@@ -1628,11 +1669,9 @@ async function handleInstantTranslate(element) {
       const preOwnSegs = ownSegments(preSegs);
       if (preOwnSegs.length === 0 || !preOwnSegs.some((s) => shouldTriggerInstant(s.text))) return;
 
-      // Only show loading for non-builtin models
-      if (settings.activeProviderId !== "builtin") {
-        showToast(i18n.t("toast.translating"));
-      }
-
+      // No "Translating..." toast here: instant mode fires on every trigger
+      // for fast typists and the popup itself is the feedback. Failure toasts
+      // below stay.
       const out = await translateFieldOwnText(freshText, {
         nativeLanguageCode: settings.nativeLanguageCode || "en",
         targetLanguage: settings.targetLanguageCode || "en",
@@ -1838,18 +1877,36 @@ function registerInstantMode() {
     if (currentSuggestion) destroyCurrentSuggestion();
   });
 
-  // Real page scrolls make the anchored position stale (chat apps): kill it.
-  // Caret auto-scrolls inside editors are nested, small and harmless — only
-  // window-level scrolls beyond a threshold count.
-  let lastScrollY = window.scrollY;
-  let lastScrollX = window.scrollX;
-  window.addEventListener('scroll', () => {
-    const dy = Math.abs(window.scrollY - lastScrollY);
-    const dx = Math.abs(window.scrollX - lastScrollX);
-    lastScrollY = window.scrollY;
-    lastScrollX = window.scrollX;
-    if (currentSuggestion && (dy > 30 || dx > 30)) destroyCurrentSuggestion();
-  });
+  // The popup is position:fixed computed from a getBoundingClientRect
+  // snapshot, so it must FOLLOW its anchor field while it is visible. Chat
+  // apps (Discord/Slack/Telegram) scroll inner message containers — those
+  // scrolls never reach the window, and the old listener KILLED the popup on
+  // window scrolls >30px instead. Now a document-level CAPTURE 'scroll'
+  // listener (capture catches inner-container scrolls of the page) plus a
+  // window 'resize' listener reposition the popup (rAF-throttled, one per
+  // frame) while its anchor field is still connected. A disconnected field
+  // (SPA re-render) has nothing to anchor to: destroy the popup, matching the
+  // element.isConnected guards used everywhere else.
+  const repositionCurrentSuggestion = () => {
+    suggestionRepositionPending = false;
+    suggestionRepositionRafId = null;
+    if (!currentSuggestion) return;
+    const field = currentSuggestion._field;
+    if (!field || !field.isConnected || !(currentSuggestion.element && currentSuggestion.element.isConnected)) {
+      destroyCurrentSuggestion();
+      return;
+    }
+    try {
+      positionSuggestionNear(currentSuggestion.element, field);
+    } catch (e) {}
+  };
+  const queueSuggestionReposition = () => {
+    if (suggestionRepositionPending) return;
+    suggestionRepositionPending = true;
+    suggestionRepositionRafId = requestAnimationFrame(repositionCurrentSuggestion);
+  };
+  document.addEventListener('scroll', queueSuggestionReposition, { capture: true, passive: true });
+  window.addEventListener('resize', queueSuggestionReposition);
   
   // Any editing keypress while a suggestion is visible kills it immediately,
   // so the popup never hangs around while the user deletes/edits text (this
@@ -1928,7 +1985,27 @@ function registerInstantMode() {
 
 async function toggleInstantDomainForCurrentUrl() {
   try {
-    const settings = await getSettings();
+    // Fetch FRESH settings, not the 3-second getSettings() cache: this
+    // function writes the whole settings object back, and writing back a
+    // cached snapshot would silently revert any change the user made in the
+    // options page inside the cache window.
+    let settings = null;
+    try {
+      const res = await safeRuntimeCall(() => chrome.runtime.sendMessage({ type: "get-settings" }));
+      if (res?.ok && res.settings) settings = res.settings;
+    } catch (error) {
+      // fall through to the direct storage read
+    }
+    if (!settings) {
+      try {
+        const data = await chrome.storage.local.get("translatorSettings");
+        if (data && data.translatorSettings) settings = data.translatorSettings;
+      } catch (error) {
+        // fall through to the cached snapshot as a last resort
+      }
+    }
+    if (!settings) settings = await getSettings();
+
     const host = window.location.hostname;
 
     // Global toggle: off -> on enables instant everywhere
@@ -2011,13 +2088,20 @@ function showToastBottomRight(message) {
 }
 
 function registerInstantToggleShortcut() {
-  document.addEventListener('keydown', async (e) => {
-    const settings = await getSettings();
-    const shortcut = settings.instantToggleShortcut || {
+  document.addEventListener('keydown', (e) => {
+    // Match and cancel SYNCHRONOUSLY, before any await: once the handler
+    // suspends we are outside the event dispatch task and preventDefault()
+    // no longer affects the default action. The match uses the synchronous
+    // settings snapshot (kept fresh by the storage.onChanged listener);
+    // the in-file fallback is the DEFAULT_TRANSLATOR_SETTINGS snapshot.
+    const snapshot = cachedSettings || DEFAULT_TRANSLATOR_SETTINGS;
+    const shortcut = snapshot.instantToggleShortcut || {
+      // Alt+Shift+I: not browser-reserved (Ctrl+Shift+I opens DevTools, which
+      // page JS cannot block).
       key: "I",
-      ctrl: true,
+      ctrl: false,
       shift: true,
-      alt: false
+      alt: true
     };
 
     // Check if shortcut matches
@@ -2030,11 +2114,13 @@ function registerInstantToggleShortcut() {
       e.shiftKey === shortcut.shift &&
       e.altKey === shortcut.alt;
 
-    if (matches) {
-      e.preventDefault();
-      e.stopPropagation();
-      await toggleInstantDomainForCurrentUrl();
-    }
+    if (!matches) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Toggle runs outside the event task and fetches FRESH settings itself.
+    toggleInstantDomainForCurrentUrl();
   }, true);
 }
 
@@ -2323,16 +2409,31 @@ function cleanupExtensionElements() {
       clearTimeout(debounceTimer);
       debounceTimer = null;
     }
-    
+
     if (instantTimer) {
       clearTimeout(instantTimer);
       instantTimer = null;
+      instantTimerField = null;
     }
 
     if (suggestionAutoHideTimer) {
       clearTimeout(suggestionAutoHideTimer);
       suggestionAutoHideTimer = null;
     }
+
+    // Pending suggestion-reposition rAF: drop it so no queued reposition runs
+    // after cleanup against dead state, and clear the throttle flag so a
+    // future suggestion can reposition again.
+    if (suggestionRepositionRafId != null) {
+      try { cancelAnimationFrame(suggestionRepositionRafId); } catch (e) {}
+      suggestionRepositionRafId = null;
+    }
+    suggestionRepositionPending = false;
+
+    // Manual-translation gate: never leave it wedged shut after a cleanup.
+    // (The old fixed translatingTimeout timer is gone — the gate now resets on
+    // completion — so only the flag needs resetting here.)
+    isTranslating = false;
 
     // Clear any global timers
     if (window.transkitCleanupTimer) {
@@ -2867,10 +2968,15 @@ function registerSelectionMode() {
     // 1. Handle Popup Open State
     if (selectionPopup) {
       if (!selectionPopup.contains(e.target)) {
-        // Clicked outside popup
-        // Prevent default to PRESERVE selection
-        e.preventDefault();
-        e.stopPropagation();
+        // Clicked outside popup: dismiss it. preventDefault preserves the
+        // text selection but would ALSO swallow the focus click, so only use
+        // it when the target is NOT an editable (input/textarea/
+        // contenteditable) — clicking into another field must focus that
+        // field normally. The popup dismisses either way.
+        if (!isEditableElement(e.target)) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
         hideTranslationPopup();
         lastPopupCloseTime = Date.now();
       }
@@ -2948,19 +3054,23 @@ function getLanguageName(code) {
 
 function makeDraggable(element, handle) {
   let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-  
-  handle.onmousedown = dragMouseDown;
+  let dragListenersActive = false;
+
+  // addEventListener (default bubble phase) instead of handle.onmousedown /
+  // document.onmousemove / document.onmouseup: assigning the on* properties
+  // clobbers whatever handler the site stored on the same property.
+  handle.addEventListener('mousedown', dragMouseDown);
 
   function dragMouseDown(e) {
     e = e || window.event;
     // Only allow left click
     if (e.button !== 0) return;
-    
+
     // Don't drag if clicking on the close button
     if (e.target.closest('.bt-selection-close')) return;
 
     e.preventDefault();
-    
+
     // Convert bottom/right to top/left if needed for consistent math
     const rect = element.getBoundingClientRect();
     element.style.bottom = 'auto';
@@ -2971,9 +3081,12 @@ function makeDraggable(element, handle) {
     // Get the mouse cursor position at startup
     pos3 = e.clientX;
     pos4 = e.clientY;
-    document.onmouseup = closeDragElement;
-    // Call a function whenever the cursor moves
-    document.onmousemove = elementDrag;
+    // Listen for mouse movement / release until the drag ends
+    if (!dragListenersActive) {
+      dragListenersActive = true;
+      document.addEventListener('mousemove', elementDrag, false);
+      document.addEventListener('mouseup', closeDragElement, false);
+    }
   }
 
   function elementDrag(e) {
@@ -2987,15 +3100,16 @@ function makeDraggable(element, handle) {
     // Set the element's new position
     element.style.top = (element.offsetTop - pos2) + "px";
     element.style.left = (element.offsetLeft - pos1) + "px";
-    
+
     // Remove arrow class when dragged to avoid visual artifacts
     element.classList.remove('bt-popup-top', 'bt-popup-bottom');
   }
 
   function closeDragElement() {
     // Stop moving when mouse button is released
-    document.onmouseup = null;
-    document.onmousemove = null;
+    dragListenersActive = false;
+    document.removeEventListener('mousemove', elementDrag, false);
+    document.removeEventListener('mouseup', closeDragElement, false);
   }
 }
 // Hover translate state
@@ -3298,6 +3412,16 @@ function findTranslatableElement(target) {
 }
 
 async function handleHoverTranslate(element, settings) {
+  // Never translate an editable (input/textarea/contenteditable, or anything
+  // inside one — isContentEditable is true for descendants of editable
+  // ancestors). A modifier keydown while hover mode is on used to translate
+  // whatever was under the cursor, including the user's own editor mid-undo.
+  let guardEl = element;
+  while (guardEl) {
+    if (isEditableElement(guardEl)) return;
+    guardEl = guardEl.parentElement;
+  }
+
   // Always use innerHTML to capture any potential formatting
   const text = element.innerHTML?.trim();
 
@@ -3728,24 +3852,45 @@ document.addEventListener("copy", (e) => {
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return;
 
-    // Check if selection intersects any TransKit UI or hover elements
     const transkitSelectors = '.bt-hover-translation, .bt-inline-suggestion, .bt-selection-icon, .bt-selection-popup, .bt-toast-notify, [data-transkit-translation="true"]';
-    const hasTranskitElements = document.querySelector(transkitSelectors);
-    if (!hasTranskitElements) return;
 
-    // Clone selection contents into a temporary fragment
-    const range = selection.getRangeAt(0);
-    const fragment = range.cloneContents();
-    
-    // Check if fragment contains any transkit elements
+    // Only rewrite the clipboard when the selection is ENTIRELY inside a
+    // TransKit element: every range's common ancestor container must live
+    // inside one of our roots. A selection that merely touches or crosses a
+    // TransKit element while mixed with page content keeps the native copy —
+    // the old intersect-based rewrite corrupted ordinary page copies whenever
+    // any TransKit element happened to exist on the page.
+    const roots = document.querySelectorAll(transkitSelectors);
+    if (roots.length === 0) return;
+
+    const insideTranskit = (node) => {
+      let cur = node;
+      while (cur) {
+        for (const root of roots) {
+          if (cur === root) return true;
+        }
+        cur = cur.parentNode;
+      }
+      return false;
+    };
+
+    for (let i = 0; i < selection.rangeCount; i++) {
+      const ancestor = selection.getRangeAt(i).commonAncestorContainer;
+      const container = ancestor.nodeType === Node.TEXT_NODE ? ancestor.parentNode : ancestor;
+      if (!container || !insideTranskit(container)) return;
+    }
+
+    // Selection is fully inside our UI: strip nested TransKit markup and copy
+    // the remaining plain text.
+    const fragment = selection.getRangeAt(0).cloneContents();
     const elementsToRemove = fragment.querySelectorAll(transkitSelectors);
     if (elementsToRemove.length > 0) {
       elementsToRemove.forEach(el => el.remove());
-      const cleanText = fragment.textContent || "";
-      if (e.clipboardData) {
-        e.clipboardData.setData("text/plain", cleanText);
-        e.preventDefault();
-      }
+    }
+    const cleanText = fragment.textContent || "";
+    if (e.clipboardData) {
+      e.clipboardData.setData("text/plain", cleanText);
+      e.preventDefault();
     }
   } catch (err) {
     // Fail silently to avoid breaking native copy
