@@ -236,6 +236,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             .split(/\n{2,}/)
             .map((p) => "ECHO:" + p.trim())
             .join("\n\n");
+          // Test infrastructure only: optional seeded echo latency (ms) to
+          // reproduce typing races deterministically. Default 0 (no change).
+          const echoDelayMs = Number(settings.testEchoDelayMs) || 0;
+          if (echoDelayMs > 0) await new Promise((r) => setTimeout(r, echoDelayMs));
           sendResponse({
             ok: true,
             result: {

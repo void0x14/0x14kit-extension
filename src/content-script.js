@@ -20,6 +20,12 @@ let translatingTimeout = null;
 let suggestionAutoHideTimer = null;
 let lastAppliedText = "";
 let lastAppliedAt = 0;
+// Stale-popup guards: instantEpoch is bumped by every typing event and every
+// dismissal; an in-flight instant translation whose epoch moved on is dropped
+// instead of materializing over newer text. applyUndoStack backs Ctrl+Z,
+// because our field writes bypass editor undo stacks.
+let instantEpoch = 0;
+const applyUndoStack = [];
 let debounceTimer = null;
 
 // Helper function to check if extension context is valid
@@ -96,6 +102,13 @@ async function sendMessageWithRetry(message, maxRetries = 2, delayMs = 150) {
 
 // Instant translate state
 let instantTimer = null;
+let instantTimerField = null; // field the pending instant trigger was armed for
+// Enter is the send key: after it, input events in that field (its own
+// newline, the site clearing the draft) must not re-arm the instant trigger —
+// otherwise a popup materializes right after sending. The latch clears on
+// the next real (non-Enter) keydown in the field, i.e. when the user
+// actually resumes typing.
+const enterLatch = new WeakSet();
 let currentSuggestion = null;
 let justAppliedTranslation = false;
 let currentKeyHandler = null; // Track active keyboard handler
@@ -721,13 +734,19 @@ async function handleAutoTranslation(element, parsed) {
     suggestion = buildInlineSuggestion(element, translation, providerInfo, 'auto');
     suggestion._segments = out.segments;
     suggestion._ownJoined = out.ownJoined;
-    
-    // Setup Tab/Esc handlers
+    suggestion._snapshotText = cleanSourceValue;
+    suggestion._field = element;
+
+    // Setup Tab/Esc handlers. Enter is deliberately untouched: it is the
+    // user's send key, and intercepting it destroyed unsent messages (and
+    // sent raw text on window-capture sites). Tab applies; Escape dismisses.
     const handleKeydown = (ev) => {
-      if (ev.key === "Tab" || (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing)) {
-        // RAT-FIX: Enter also applies the translation (never sends raw text)
+      if (ev.target !== element && !(suggestion.element && suggestion.element.contains(ev.target))) return;
+      if (ev.key === "Tab") {
         ev.preventDefault();
-        setFieldText(element, translation);
+        ev.stopPropagation();
+        ev.stopImmediatePropagation();
+        applySuggestionSafely(element, suggestion, translation);
         suggestion.destroy();
         document.removeEventListener("keydown", handleKeydown, true);
       } else if (ev.key === "Escape") {
@@ -883,11 +902,24 @@ async function setFieldText(element, text, options = {}) {
   if (!isBox) {
     try { snapshotTemplate = element.cloneNode(true); } catch (e) {}
   }
+  const originalText = readFieldText(element);
 
   const verified = () => {
     if (!normalizedTarget) return true;
-    const now = readFieldText(element).replace(/\s+/g, " ").trim();
-    return now === normalizedTarget;
+    const now = readFieldText(element);
+    if (now.replace(/\s+/g, " ").trim() === normalizedTarget) return true;
+    const nowNoWs = now.replace(/\s+/g, "");
+    const targetNoWs = String(text || "").replace(/\s+/g, "");
+    if (nowNoWs === targetNoWs) return true;
+    // Box value-writes are atomic: a strict prefix here means the site
+    // ACCEPTED the write and stored its own clipped/transformed form
+    // (maxLength, normalizers) — success from the user's point of view.
+    // A partial write can never happen for a value assignment; content-
+    // editable inserts stay strict.
+    if (isBox) {
+      return nowNoWs.length > 0 && targetNoWs.startsWith(nowNoWs);
+    }
+    return false;
   };
 
   const raf = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
@@ -928,6 +960,23 @@ async function setFieldText(element, text, options = {}) {
     await raf(); await raf();
     if (verified()) return true;
   }
+
+  // Every strategy failed: put the field back exactly as the user left it.
+  // A half-applied attempt or a leftover select-all must never survive — the
+  // next keystroke would otherwise wipe the user's text.
+  try {
+    if (isBox) {
+      const setter = nativeValueSetter(element, isBox);
+      if (setter) setter.call(element, originalText);
+      else element.value = originalText;
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      try { element.setSelectionRange(element.value.length, element.value.length); } catch (_) {}
+    } else if (snapshotTemplate) {
+      const fresh = snapshotTemplate.cloneNode(true);
+      element.replaceChildren(...Array.from(fresh.childNodes));
+      element.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    }
+  } catch (e) {}
   return false;
 }
 
@@ -1197,13 +1246,18 @@ function buildInlineSuggestion(element, translatedText, providerInfo, position =
   container.innerHTML = `
     <div class="bt-suggestion-content">
       <span class="bt-suggestion-icon">🔄</span>
-      <span class="bt-suggestion-text">${translatedText}</span>
+      <span class="bt-suggestion-text"></span>
       <kbd class="bt-suggestion-tab-hint">Tab</kbd>
     </div>
     <div class="bt-suggestion-footer">
       <div class="bt-suggestion-provider-container"></div>
     </div>
   `;
+  // Provider/model output is untrusted — never interpolate it as HTML.
+  const suggestionTextEl = container.querySelector('.bt-suggestion-text');
+  if (suggestionTextEl) {
+    suggestionTextEl.textContent = translatedText == null ? "" : String(translatedText);
+  }
   
   // Prevent clicking on the suggestion from blurring the input
   // EXCEPT for select elements (allow clicking model selector)
@@ -1270,6 +1324,47 @@ function populateProviderSelectorForSuggestion(container, settings) {
   }
 }
 
+// Shared apply path for every suggestion popup (instant + !!cmd). Order of
+// defense, each independent:
+// 1. Drift guard — the popup translates a SNAPSHOT taken at trigger time. If
+//    the field text has changed since (user kept typing, paste, site script),
+//    replacing the field would destroy that delta. Refuse and retire.
+// 2. Undo — our writes bypass editor undo stacks, so record the previous text
+//    for Ctrl+Z (see the keydown handler in registerInstantMode).
+function applySuggestionSafely(element, suggestion, translatedText) {
+  const norm = (t) => stripInvisibleChars(
+    String(t || "").replace(TRANSLATION_COMMAND_PATTERN, "").trimEnd()
+  ).replace(/\s+/g, " ").trim();
+
+  if (suggestion && suggestion._snapshotText != null) {
+    const now = norm(readFieldText(element));
+    const snapshot = norm(suggestion._snapshotText);
+    if (now !== snapshot) {
+      // Text moved on while we translated: a replace would eat the delta.
+      destroyCurrentSuggestion();
+      return false;
+    }
+  }
+
+  const prevText = readFieldText(element);
+  setFieldText(element, translatedText, { immediate: true }).then((ok) => {
+    if (!ok) return;
+    const applied = stripInvisibleChars(translatedText || "");
+    lastAppliedText = applied;
+    lastAppliedAt = Date.now();
+    // Record what the field ACTUALLY holds (a maxLength site may have stored
+    // a clipped form) so the Ctrl+Z equality check matches reality.
+    applyUndoStack.push({
+      element,
+      prevText,
+      appliedText: stripInvisibleChars(readFieldText(element) || ""),
+      at: Date.now()
+    });
+    if (applyUndoStack.length > 20) applyUndoStack.shift();
+  });
+  return true;
+}
+
 
 function setupSuggestionKeyHandlers(element, suggestion) {
   // CRITICAL: Remove any existing handler first
@@ -1284,15 +1379,28 @@ function setupSuggestionKeyHandlers(element, suggestion) {
   let isApplying = false; // Prevent multiple calls
 
   const handleKey = (ev) => {
-    // RAT-FIX: Enter applies the translation too (never sends the raw text).
-    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      ev.stopImmediatePropagation();
-      if (ev.type === "keyup") return false;
-      if (isApplying) return false;
-      applyTranslation();
-      return false;
+    // Scope: only act on keys aimed at this popup's own field or the popup.
+    // Enter/Tab/Escape in the site's search box, another chat or a modal
+    // must keep reaching the site untouched. resolveEditableFromEvent is
+    // composedPath-based, so shadow-root fields resolve correctly even
+    // though ev.target is retargeted to the host element.
+    const target = ev.target;
+    const resolved = resolveEditableFromEvent(ev);
+    const inField = target === element ||
+      (target && typeof element.contains === "function" && element.contains(target)) ||
+      (resolved && (resolved === element || element.contains(resolved)));
+    const inPopup = !!(target && suggestion.element && suggestion.element.contains(target));
+    // Focus may legitimately sit on <body> while a suggestion is up (site
+    // re-renders drop it); applying is still what the user asked for. Only
+    // refuse when ANOTHER editable field owns focus — its keys are its own.
+    const focusElsewhere = !!(resolved && resolved !== element && !element.contains(resolved));
+    if (!inField && !inPopup && focusElsewhere) return;
+
+    if (ev.key === "Enter") {
+      // Enter is the user's send key: never intercepted, never applied. It
+      // passes through untouched; the document-level listener in
+      // registerInstantMode retires the suggestion instead.
+      return;
     }
 
     // Only handle specific keys, let everything else pass through
@@ -1357,9 +1465,7 @@ function setupSuggestionKeyHandlers(element, suggestion) {
     // editors (Lexical etc.) swallow inserts that arrive within one macrotask
     // of a handled keydown ("bogus text replacement" guard).
     setTimeout(() => {
-      setFieldText(element, suggestion.translatedText, { immediate: true });
-      lastAppliedText = stripInvisibleChars(suggestion.translatedText || "");
-      lastAppliedAt = Date.now();
+      applySuggestionSafely(element, suggestion, suggestion.translatedText);
     }, 0);
 
     // Destroy popup after a tiny delay to ensure insertion completes
@@ -1378,13 +1484,9 @@ function setupSuggestionKeyHandlers(element, suggestion) {
   };
 
   const dismiss = () => {
-    window.removeEventListener("keydown", handleKey, true);
-    window.removeEventListener("keyup", handleKey, true);
-    document.removeEventListener("keydown", handleKey, true);
-    document.removeEventListener("keyup", handleKey, true);
-    currentKeyHandler = null;
-    suggestion.destroy();
-    currentSuggestion = null;
+    // Funnel through the global teardown so any in-flight translation for
+    // this field is invalidated too (no resurrection after Escape).
+    destroyCurrentSuggestion();
   };
 
   // Store reference and add listeners at MULTIPLE levels with CAPTURE
@@ -1493,16 +1595,19 @@ async function handleInstantTranslate(element) {
   if (instantTimer) {
     clearTimeout(instantTimer);
     instantTimer = null;
+    instantTimerField = null;
   }
 
-  // Dismiss existing suggestion
-  if (currentSuggestion) {
-    currentSuggestion.destroy();
-    currentSuggestion = null;
-  }
+  // Dismiss existing suggestion through the funnel: a manual destroy here
+  // used to leave the old popup's window-capture Enter/Tab handler installed,
+  // so a later Enter could silently overwrite the field with a stale
+  // translation.
+  destroyCurrentSuggestion();
 
   // Start new timer
+  instantTimerField = element;
   instantTimer = setTimeout(async () => {
+    const epochAtStart = instantEpoch;
     try {
       // SPA re-render may have removed the field while we waited
       if (!element.isConnected) return;
@@ -1539,6 +1644,16 @@ async function handleInstantTranslate(element) {
       if (!element.isConnected) return;
 
       if (out?.res?.contextInvalidated) { cleanupExtensionElements(); return; }
+
+      // The user typed (or dismissed something) while we translated: this
+      // snapshot is stale. Drop it silently — their typing has already armed
+      // a fresh trigger.
+      if (instantEpoch !== epochAtStart) return;
+
+      // Belt-and-braces: never build a popup over text that no longer matches
+      // the snapshot we translated.
+      if (stripInvisibleChars(element.value || element.innerText || "") !== freshText) return;
+
       if (out?.failed) {
         showToast(out.res?.error || i18n.t("toast.translationFailed"));
         return;
@@ -1551,6 +1666,8 @@ async function handleInstantTranslate(element) {
       currentSuggestion = buildInlineSuggestion(element, out.translation, providerInfo, position, settings);
       currentSuggestion._segments = out.segments;
       currentSuggestion._ownJoined = out.ownJoined;
+      currentSuggestion._snapshotText = freshText;
+      currentSuggestion._field = element;
       setupSuggestionKeyHandlers(element, currentSuggestion);
       // Auto-expire: a suggestion is only useful for a few seconds
       suggestionAutoHideTimer = setTimeout(() => {
@@ -1590,20 +1707,30 @@ async function reTranslateSuggestion(element, ownJoinedText, providerId, setting
     });
 
     if (res?.ok && res.result?.translation) {
-      // Rebuild around quotes so provider switching never leaks quotes
-      let final = res.result.translation;
-      if (currentSuggestion._segments && ownSegments(currentSuggestion._segments).length > 0) {
-        const parts = final.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
-        const own = ownSegments(currentSuggestion._segments);
+      // Rebuild around quotes so provider switching never leaks quotes. On
+      // alignment failure the provider returned only the own-text (quotes
+      // were never sent): keeping the previous translation is the only safe
+      // outcome — assigning it would overwrite quoted material on apply.
+      let final = null;
+      const segs = currentSuggestion._segments;
+      const own = segs ? ownSegments(segs) : [];
+      if (own.length > 0) {
+        const parts = res.result.translation.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
         if (parts.length === own.length) {
-          final = rebuildWithTranslations(currentSuggestion._segments, parts);
+          final = rebuildWithTranslations(segs, parts);
         }
+      } else {
+        final = res.result.translation;
       }
-      if (textEl) {
-        textEl.textContent = final;
+      if (final != null) {
+        if (textEl) {
+          textEl.textContent = final;
+          textEl.classList.remove('bt-loading-text');
+        }
+        currentSuggestion.translatedText = final;
+      } else if (textEl) {
         textEl.classList.remove('bt-loading-text');
       }
-      currentSuggestion.translatedText = final;
     }
   } catch (err) {
     console.error("Re-translation error:", err);
@@ -1618,10 +1745,14 @@ async function reTranslateSuggestion(element, ownJoinedText, providerId, setting
 // Kill the current suggestion and every thing attached to it (key handlers,
 // pending timers). Single funnel so no path can leave a stale popup behind.
 function destroyCurrentSuggestion() {
+  // Every dismissal invalidates in-flight instant translations: one that
+  // completes after the user walked away must never rebuild a popup.
+  instantEpoch++;
   if (instantTimer) {
     clearTimeout(instantTimer);
     instantTimer = null;
   }
+  instantTimerField = null;
   if (suggestionAutoHideTimer) {
     clearTimeout(suggestionAutoHideTimer);
     suggestionAutoHideTimer = null;
@@ -1653,6 +1784,13 @@ function registerInstantMode() {
     // is a host element or where focus is moved programmatically after typing.
     const element = resolveEditableFromEvent(e);
     if (!element) return;
+
+    // Typing invalidates any in-flight instant translation (stale-popup guard).
+    instantEpoch++;
+
+    // Input caused by Enter (its newline / the send clearing the draft) is
+    // not typing: never re-arm the instant trigger behind the user's back.
+    if (enterLatch.has(element)) return;
 
     // Don't interfere with manual mode
     if (isTranslating) return;
@@ -1723,27 +1861,64 @@ function registerInstantMode() {
     destroyCurrentSuggestion();
   }, true);
 
-  // Listen for Enter key to cancel instant translate
+  // Enter is the user's send key: it passes through untouched. Its only job
+  // here is retiring the suggestion / pending trigger for the field it was
+  // pressed in, so a late-arriving translation can never resurrect over a
+  // sent message.
   document.addEventListener('keydown', (e) => {
+    const el = resolveEditableFromEvent(e);
+    if (!el) return;
     if (e.key === 'Enter') {
-      // User wants to send message immediately, cancel any pending translation
-      if (instantTimer) {
+      if (e.isComposing) return;
+      enterLatch.add(el);
+      if (currentSuggestion && currentSuggestion._field === el) destroyCurrentSuggestion();
+      if (instantTimer && instantTimerField === el) {
         clearTimeout(instantTimer);
         instantTimer = null;
+        instantTimerField = null;
       }
-      
-      // Dismiss any visible suggestion
-      if (currentSuggestion) {
-        currentSuggestion.destroy();
-        currentSuggestion = null;
-      }
-      
-      // Remove keyboard handler if active
-      if (currentKeyHandler) {
-        document.removeEventListener("keydown", currentKeyHandler, true);
-        currentKeyHandler = null;
-      }
+      return;
     }
+    // Any other key in the field = the user is typing again: real input
+    // events from here on may arm the instant trigger normally.
+    if (enterLatch.has(el)) enterLatch.delete(el);
+  }, true);
+
+  // Ctrl+Z undo for our applies: setFieldText writes bypass editor undo
+  // stacks (a native value write is not an undoable edit), so this is the
+  // user's only way back. Intercept ONLY when the field's current text is
+  // exactly what we last applied there — otherwise the site's own undo runs.
+  document.addEventListener('keydown', (e) => {
+    const key = (e.key || "").toLowerCase();
+    if (key !== "z") return;
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+
+    const entry = applyUndoStack[applyUndoStack.length - 1];
+    if (!entry) return;
+    if (!entry.element.isConnected) { applyUndoStack.pop(); return; }
+
+    const el = resolveEditableFromEvent(e);
+    if (el !== entry.element) return;
+
+    const norm = (t) => stripInvisibleChars(String(t || "")).replace(/\s+/g, " ").trim();
+    if (norm(readFieldText(entry.element)) !== norm(entry.appliedText)) {
+      // The user edited after our apply: native undo owns the field again.
+      applyUndoStack.pop();
+      return;
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    applyUndoStack.pop();
+    destroyCurrentSuggestion();
+    justAppliedTranslation = true;
+    setTimeout(() => { justAppliedTranslation = false; }, 1500);
+    setFieldText(entry.element, entry.prevText, { immediate: true }).then((ok) => {
+      if (!ok) return;
+      lastAppliedText = stripInvisibleChars(entry.prevText || "");
+      lastAppliedAt = Date.now();
+    });
   }, true);
 }
 
@@ -1807,6 +1982,7 @@ async function toggleInstantDomainForCurrentUrl() {
     if (nowExcluded && instantTimer) {
       clearTimeout(instantTimer);
       instantTimer = null;
+      instantTimerField = null;
     }
 
     // Dismiss current suggestion when disabling
